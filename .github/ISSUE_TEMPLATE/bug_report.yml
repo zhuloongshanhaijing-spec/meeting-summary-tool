@@ -1,0 +1,28 @@
+name: Bug report
+description: Report a reproducible problem without attaching private meeting data.
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: "Do not attach real meeting audio, transcripts, notes, credentials, or generated private outputs."
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Minimal reproduction
+      description: Use synthetic data only; include commands and sanitized output.
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      placeholder: macOS version, Python version, engine availability
+    validations:
+      required: true

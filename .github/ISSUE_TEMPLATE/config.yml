@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security and privacy reports
+    url: https://github.com/zhuloongshanhaijing-spec/meeting-summary-tool/security/advisories/new
+    about: Do not disclose vulnerabilities or private data in a public issue.

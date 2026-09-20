@@ -1,0 +1,7 @@
+{
+  "whisper_bin": "/path/to/whisper.cpp/build/bin/whisper-cli",
+  "whisper_model": "/path/to/whisper.cpp/models/ggml-large-v3-turbo-q5_0.bin",
+  "qwen_python": "/path/to/qwen-asr-venv/bin/python",
+  "ollama_url": "http://127.0.0.1:11434",
+  "ollama_model": "qwen3:8b"
+}

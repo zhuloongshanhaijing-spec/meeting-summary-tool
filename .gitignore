@@ -1,0 +1,8 @@
+# Generated artifacts
+runs/
+outputs/*/
+input/
+config.json
+__pycache__/
+*.pyc
+.DS_Store
