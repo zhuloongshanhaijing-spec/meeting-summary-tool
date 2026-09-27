@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
+<title>会议知识编译台</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<div id="offline" class="offline" role="status" hidden>连接已断开，正在重试…</div>
+
+<main class="wrap">
+
+  <header class="masthead">
+    <h1>会议知识编译台</h1>
+    <div class="mast-right">
+      <span id="pid" class="pid num" hidden></span>
+      <span id="badge" class="badge badge-idle" role="status" aria-label="运行状态：空闲">
+        <i class="bdot" aria-hidden="true"></i><span id="badge-text">空闲</span>
+      </span>
+    </div>
+  </header>
+
+  <section class="panel" aria-labelledby="h-drop">
+    <h2 id="h-drop">投放材料</h2>
+    <div class="drops">
+      <div class="drop-col">
+        <div class="drop" id="drop-audio" role="button" tabindex="0"
+             aria-label="投放录音文件：把文件拖到这里，或按回车键选择文件，支持多选">
+          <p class="drop-title">把录音文件拖到这里，或点击选择</p>
+          <p class="drop-hint num">m4a · mp3 · wav · aac · flac · aiff · caf</p>
+        </div>
+        <ul class="filelist" id="list-audio" aria-label="已选录音文件"></ul>
+      </div>
+      <div class="drop-col">
+        <div class="drop" id="drop-notes" role="button" tabindex="0"
+             aria-label="投放笔记文件：把 .md 或 .txt 拖到这里，或按回车键选择文件，支持多选">
+          <p class="drop-title">把笔记 .md 拖到这里</p>
+          <p class="drop-hint num">md · markdown · txt</p>
+        </div>
+        <ul class="filelist" id="list-notes" aria-label="已选笔记文件"></ul>
+      </div>
+    </div>
+    <input type="file" id="pick-audio" class="pick" multiple
+           accept=".m4a,.mp3,.wav,.aac,.flac,.aiff,.caf" hidden>
+    <input type="file" id="pick-notes" class="pick" multiple
+           accept=".md,.markdown,.txt" hidden>
+    <div class="controls">
+      <label class="ctl">
+        <span class="ctl-l">会议名称</span>
+        <input type="text" id="event-name" placeholder="如「产品周会-0925」；留空自动生成" autocomplete="off">
+      </label>
+      <label class="ctl">
+        <span class="ctl-l">输出目录</span>
+        <input type="text" id="output-dir" placeholder="默认 outputs/，或点「选择」挑文件夹" autocomplete="off" spellcheck="false">
+      </label>
+      <button id="btn-pick-dir" class="btn btn-ghost" type="button" aria-label="打开系统对话框选择输出文件夹">选择…</button>
+      <button id="btn-start" class="btn btn-primary" type="button">开始编译</button>
+      <button id="btn-stop" class="btn btn-stop" type="button" hidden>停止</button>
+    </div>
+  </section>
+
+  <section class="panel" aria-labelledby="h-progress">
+    <h2 id="h-progress">处理进度</h2>
+
+    <div class="totals" id="totals"></div>
+
+    <div class="track-wrap">
+      <ol class="track" id="track" aria-label="编译阶段轨道，尚未开始"></ol>
+    </div>
+    <p class="track-detail" id="track-detail"><span class="dim">尚未开始编译</span></p>
+
+    <div class="event-card" id="event-card" hidden></div>
+
+    <div class="subblock">
+      <h3>队列</h3>
+      <ul class="queue" id="queue"></ul>
+    </div>
+
+    <div class="subblock">
+      <h3>时间线</h3>
+      <ul class="timeline" id="timeline"></ul>
+    </div>
+  </section>
+
+  <section class="panel" aria-labelledby="h-results">
+    <h2 id="h-results">结果包</h2>
+    <section id="results-root" class="results-root"></section>
+  </section>
+
+  <footer class="foot">本地流水线 · 数据不出本机 · 产物写入 outputs/</footer>
+
+</main>
+
+<div id="toasts" class="toasts" aria-live="polite"></div>
+
+<script src="/static/results.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

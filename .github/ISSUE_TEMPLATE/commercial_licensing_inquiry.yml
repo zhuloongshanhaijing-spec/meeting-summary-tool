@@ -1,0 +1,61 @@
+name: Commercial licensing inquiry
+description: Ask about separate written permission for commercial use (noncommercial use needs no application — see LICENSE).
+title: "[Commercial licensing]: "
+labels: [licensing]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This repository uses the PolyForm Noncommercial License 1.0.0.
+        **Noncommercial use requires no application** — proceed directly under the LICENSE.
+        Commercial use is **not licensed by this repository** and needs **separate written
+        permission**. Submitting this inquiry does **not** grant any rights.
+        See [COMMERCIAL_LICENSING.md](../blob/main/COMMERCIAL_LICENSING.md).
+        **Do not post** API keys/credentials, real meeting audio/transcripts/notes,
+        personal sensitive information, or client-confidential material. Only the
+        minimal summary fields below are needed.
+  - type: textarea
+    id: purpose
+    attributes:
+      label: Intended use (brief overview)
+      description: One or two sentences on how you plan to use the project.
+    validations:
+      required: true
+  - type: dropdown
+    id: entity
+    attributes:
+      label: Deployment entity type
+      options:
+        - Individual
+        - Company
+        - Team / internal group
+        - Institution (school / research / nonprofit)
+        - Product integration (bundled into another product)
+        - Other (explain in the field above)
+    validations:
+      required: true
+  - type: dropdown
+    id: charging
+    attributes:
+      label: Paid or for-profit use?
+      options:
+        - No — purely noncommercial
+        - Yes — charging users / direct revenue
+        - Yes — internal cost-saving within a for-profit entity
+        - Unsure — please advise
+    validations:
+      required: true
+  - type: textarea
+    id: scale
+    attributes:
+      label: Expected scale
+      description: Rough deployment count, user base, or team size. Estimates are fine.
+    validations:
+      required: true
+  - type: textarea
+    id: contact
+    attributes:
+      label: Preferred reply channel
+      description: Replies default to this issue. If you need another channel, describe it here — do NOT paste private emails or phone numbers.
+    validations:
+      required: false

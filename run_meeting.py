@@ -85,6 +85,76 @@ def load_jsonl(path: Path) -> list[dict]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
+# --- Web-console observability (docs/web-console-design.md §4) ---------------
+# Canonical stage table for the console step bar; keys are stable contract —
+# webapp/server.py maps them to UI labels, tests pin the schema.
+STAGE_ORDER: list[tuple[str, str]] = [
+    ("inventory", "文件清单"),
+    ("audio_prepare", "音频预处理（降噪）"),
+    ("lang_probe", "语言探测"),
+    ("asr", "语音识别"),
+    ("literal", "组装逐句记录"),
+    ("evidence", "生成证据"),
+    ("relevance", "无关话语过滤"),
+    ("reconcile", "主题提取与索引"),
+    ("audit", "claim 保真审计"),
+    ("notes", "笔记佐证"),
+    ("package", "构建报告包"),
+    ("validate", "验证与质量门禁"),
+]
+
+_progress_state: dict[str, dict] = {}  # event -> {"stage": str, "stage_started": float}
+
+
+def _stage_index(stage: str) -> int:
+    base = stage.split(".")[0]  # "asr.qwen" belongs to the "asr" step
+    for i, (key, _label) in enumerate(STAGE_ORDER, 1):
+        if key == base:
+            return i
+    return 0
+
+
+def emit_progress(event: str, kind: str, stage: str = "", message: str = "",
+                  status: str = "running", counters: dict | None = None) -> None:
+    """Append one line to runs/progress.jsonl and atomically refresh
+    runs/<event>/.progress.json. Best-effort by design: observability must
+    never break the pipeline."""
+    try:
+        ts = time.time()
+        runs_dir = WORKSPACE / "runs"
+        runs_dir.mkdir(parents=True, exist_ok=True)
+        state = _progress_state.setdefault(event, {"stage": "", "stage_started": ts})
+        if stage and stage != state["stage"]:
+            state["stage"] = stage
+            state["stage_started"] = ts
+        line = {"ts": round(ts, 3), "event": event, "kind": kind, "stage": stage,
+                "message": message, "status": status, "counters": counters or {}}
+        with (runs_dir / "progress.jsonl").open("a", encoding="utf-8") as f:
+            f.write(json.dumps(line, ensure_ascii=False) + "\n")
+        atomic_json(runs_dir / event / ".progress.json", {
+            "event": event, "status": status, "stage": state["stage"],
+            "stage_index": _stage_index(state["stage"]),
+            "stage_total": len(STAGE_ORDER),
+            "stage_started": round(state["stage_started"], 3),
+            "message": message, "updated": round(ts, 3)})
+    except Exception:
+        pass
+
+
+def resolve_output_dir(event: dict) -> Path:
+    """Default outputs/<name>; overridable per-event via a web-console-written
+    .mst-output.json next to the inputs (dot-file: invisible to
+    find_input_events, removed with the event dir on success)."""
+    try:
+        override = json.loads((event["dir"] / ".mst-output.json")
+                              .read_text(encoding="utf-8")).get("output_dir")
+        if override:
+            return Path(override).expanduser()
+    except (OSError, json.JSONDecodeError, AttributeError, TypeError):
+        pass
+    return WORKSPACE / "outputs" / event["name"]
+
+
 def check_memory() -> dict:
     """Quick memory snapshot."""
     try:
@@ -147,6 +217,7 @@ def find_input_events() -> list[dict]:
     note_names = {"notes.md", "note.md"}
     events: list[dict] = []
     loose_audio, loose_notes = [], None
+    INPUT_DIR.mkdir(parents=True, exist_ok=True)  # fresh clone: input/ not in git
     for entry in sorted(INPUT_DIR.iterdir(), key=lambda p: p.name):
         if entry.name.startswith("."):
             continue
@@ -236,28 +307,36 @@ def stage_asr(run_dir: Path, manifest: Path) -> tuple[Path | None, Path | None]:
       - probes disagree/other -> Qwen3-ASR 'auto' (code-switching capable)
     Returns (qwen_json_path | None, whisper_json_path | None).
     """
+    ev = run_dir.name
+    emit_progress(ev, "stage", "lang_probe", "语言探测（3 点采样 whisper 探针）")
     probes = detect_language(run_dir)
     log(f"Stage 3/9: 语音识别（语言探测: {probes or '未知'}）...")
     unique = set(probes)
     if unique == {"en"} and WHISPER_BIN.exists():
         log("  英语主导 → whisper.cpp 全文件转录")
+        emit_progress(ev, "stage", "asr.whisper", "whisper.cpp 全文件转录（英语）")
         whisper_json = _whisper_full_file(run_dir, "en")
         return None, whisper_json
     if unique and WHISPER_BIN.exists() and "en" not in unique:
         log("  非英语主导 → Qwen3-ASR(Chinese) + whisper auto 交叉校验/混说基础")
         # auto (unforced) lets whisper render code-switched speech natively;
         # record assembly decides per transcript whether whisper is the base.
+        emit_progress(ev, "stage", "asr.whisper", "whisper.cpp 交叉校验转录（auto）")
         whisper_json = _whisper_full_file(run_dir, None)
     elif not probes and WHISPER_BIN.exists():
         log("  探测失败 → whisper.cpp 全文件转录（默认英语）")
+        emit_progress(ev, "stage", "asr.whisper", "whisper.cpp 全文件转录（探测失败默认英语）")
         whisper_json = _whisper_full_file(run_dir, "en")
         return None, whisper_json
     else:
         log("  混合语言/探测分歧 → Qwen3-ASR auto（支持中英混说）")
+        if WHISPER_BIN.exists():
+            emit_progress(ev, "stage", "asr.whisper", "whisper.cpp 交叉校验转录（auto）")
         whisper_json = _whisper_full_file(run_dir, None) if WHISPER_BIN.exists() else None
 
     # Qwen3-ASR segmented path (zh or mixed)
     log("  音频分段 (20s 窗口 × 3 音轨)...")
+    emit_progress(ev, "stage", "asr.segment", "音频分段（20s 窗口 × 3 音轨）")
     run(["python3", "-B", str(CORE / "scripts/segment_asr_windows.py"),
          "--manifest", str(manifest),
          "--prepared-run", str(run_dir / "prepared"),
@@ -268,6 +347,7 @@ def stage_asr(run_dir: Path, manifest: Path) -> tuple[Path | None, Path | None]:
         log(f"  ⚠ 内存不足 ({mem['available_gb']:.1f}GB)，先释放 Ollama...")
         unload_ollama()
         time.sleep(5)
+    emit_progress(ev, "stage", "asr.qwen", "Qwen3-ASR 窗口转录（MPS）")
     run([str(QWEN_PYTHON), "-B", str(QWEN_SCRIPT),
          "--input", str(run_dir / "asr_windows" / "flat"),
          "--output-dir", str(run_dir / "asr_primary"),
@@ -862,8 +942,9 @@ def process_event(event: dict, args) -> bool:
     """Run the full pipeline for one event (audio files + optional notes)."""
     name = event["name"]
     run_dir = WORKSPACE / "runs" / name
-    output_dir = WORKSPACE / "outputs" / name
+    output_dir = resolve_output_dir(event)
     log(f"=== 事件处理开始: {name} ===")
+    emit_progress(name, "stage", "inventory", "文件清单")
 
     source_dir = run_dir / "source"
     source_dir.mkdir(parents=True, exist_ok=True)
@@ -875,6 +956,7 @@ def process_event(event: dict, args) -> bool:
         shutil.copy2(event["notes"], source_dir / event["notes"].name)
 
     manifest = stage_inventory(run_dir, source_dir)
+    emit_progress(name, "stage", "audio_prepare", "音频预处理（arnndn RNN 降噪）")
     stage_audio_prepare(run_dir, manifest)
 
     if not args.skip_asr:
@@ -883,13 +965,19 @@ def process_event(event: dict, args) -> bool:
         qwen_json = run_dir / "asr_primary/qwen3_asr_candidates.json"
         whisper_json = next(iter(run_dir.glob("whisper_*.json")), None)
 
+    emit_progress(name, "stage", "literal", "组装逐句记录（逐轨引擎仲裁）")
     records_path = stage_literal_records(run_dir, qwen_json, whisper_json)
+    emit_progress(name, "stage", "evidence", "生成证据文件")
     evidence_path = stage_evidence(run_dir, records_path)
+    emit_progress(name, "stage", "relevance", "无关话语过滤（只标注不删除）")
     annotated_path, reconcile_view = stage_relevance(run_dir, records_path, evidence_path)
+    emit_progress(name, "stage", "reconcile", "主题提取与索引构建（Ollama）")
     reconciled_path = stage_reconcile(run_dir, reconcile_view)
+    emit_progress(name, "stage", "audit", "claim 保真审计")
     reconciled_path = stage_audit_claims(run_dir, reconciled_path)
 
     if not args.skip_notes and event["notes"]:
+        emit_progress(name, "stage", "notes", "笔记佐证处理")
         note_relations_path = stage_notes(run_dir, event["notes"], manifest, records_path)
     else:
         note_relations_path = run_dir / "notes/note_relations.jsonl"
@@ -900,7 +988,9 @@ def process_event(event: dict, args) -> bool:
         # event name supersedes the old package, so cross-event search
         # never serves stale duplicates. runs/ keeps rebuild artifacts.
         shutil.rmtree(output_dir)
+    emit_progress(name, "stage", "package", f"构建完整报告包 → {output_dir}")
     stage_build_package(run_dir, evidence_path, annotated_path, reconciled_path, note_relations_path, output_dir)
+    emit_progress(name, "stage", "validate", "验证报告包 + 质量门禁")
     ok = stage_validate(output_dir, run_dir)
 
     log(f"=== 事件完成: {name} -> {output_dir} ===")
@@ -926,11 +1016,17 @@ def main():
     failures = []
     try:
         for event in events:
+            emit_progress(event["name"], "event_start",
+                          message=f"开始处理（{len(event['audio'])} 个音频，笔记{'有' if event['notes'] else '无'}）")
             try:
                 if not process_event(event, args):
                     failures.append(event["name"])
+                    emit_progress(event["name"], "event_failed", status="failed", message="质量门禁未通过")
+                else:
+                    emit_progress(event["name"], "event_done", status="done", message="事件完成")
             except Exception as exc:  # one bad event must not block the rest
                 log(f"❌ 事件 {event['name']} 失败: {exc}")
+                emit_progress(event["name"], "event_failed", status="failed", message=str(exc)[:300])
                 import traceback
                 traceback.print_exc()
                 failures.append(event["name"])

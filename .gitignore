@@ -6,3 +6,6 @@ config.json
 __pycache__/
 *.pyc
 .DS_Store
+
+# Bootstrap-managed third-party deps (setup.sh: whisper.cpp / models / venv)
+vendor/
