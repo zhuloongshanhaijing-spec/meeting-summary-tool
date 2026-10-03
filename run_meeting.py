@@ -1,11 +1,20 @@
 #!/usr/bin/env python3
-"""一键会议处理：音频 + 笔记 → 完整报告包（主题索引、逐句记录、报告、数据库、笔记佐证）
+"""一键会议处理：音频 + 录屏视频 + 笔记 → 完整报告包（主题索引、逐句记录、报告、数据库、笔记佐证）
 
 用法：
     python3 run_meeting.py [--name 会议名称]
 
-输入：input/ 文件夹中的 .m4a/.mp3/.wav 录音 + notes.md 笔记
+输入：input/ 文件夹中的 .m4a/.mp3/.wav 录音、.mp4/.mov/.mkv/.webm/.m4v 录屏、notes.md 笔记
 输出：outputs/<名称>/ 完整报告包
+
+录屏事件（docs/screen-recording-parsing-design.md）：video_ingest 站把视频分解为
+音轨（注入 manifest 后当普通音轨处理，零特判）+ 幻灯片轨（runs/<event>/slides/），
+slide_align 站产出真实 relations。v1 决定（§3.4）：reconcile 视图保持 audio-only —
+image 证据行（I######）经 runs/<event>/evidence/evidence_audio_only.jsonl 侧车文件
+与 relevance_filter / quality_gate 隔离（重跑不再产生 image 行时会清扫侧车防残留），
+PPT 内容经 relations/《03_PPT补充信息》层参与；区域未经人工确认或区域降级仅音轨时，
+报告标注写入 outputs/<event>/00_使用说明.md。
+纯音频/笔记事件不产生任何新工件，输出与 12 站时代逐字节一致。
 
 资源控制：大模型独占顺序执行，light 阶段最多 2 并行，系统预留 2GB。
 """
@@ -13,6 +22,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util as _importlib_util
 import json
 import os
 import re
@@ -35,12 +45,43 @@ NOTE_LAYER = WORKSPACE / "note-layer"
 import config as _config
 
 _CFG = _config.resolve()
-QWEN_PYTHON = Path(_CFG["qwen_python"])
+QWEN_PYTHON = Path(_CFG["qwen_python"]) if _CFG.get("qwen_python") else None
 QWEN_SCRIPT = CORE / "scripts" / "run_qwen3_asr.py"
 WHISPER_BIN = Path(_CFG["whisper_bin"])
 WHISPER_MODEL = Path(_CFG["whisper_model"])
 OLLAMA_URL = _CFG["ollama_url"]
 OLLAMA_MODEL = _CFG["ollama_model"]
+# Interpreter of vendor/tools-venv (numpy/cv2/pypinyin) for the three
+# screen-recording tools ONLY (design §3.4). config.resolve() always supplies
+# a truthy default (config.py:27), so no local fallback branch is needed.
+TOOLS_PYTHON = Path(_CFG["tools_python"])
+
+
+def _load_core_module(name: str):
+    """Import a core/scripts module by path (stdlib-safe modules only).
+
+    meeting_pipeline owns the VIDEO_EXTENSIONS whitelist (design §3.4: import,
+    never duplicate); align_audio_slides owns the CJK-compact bigram similarity
+    reused by stage_slide_align (design §4.5 "复用 align_audio_slides 词面候选").
+    """
+    spec = _importlib_util.spec_from_file_location(f"mst_{name}", CORE / "scripts" / f"{name}.py")
+    module = _importlib_util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_PIPELINE = _load_core_module("meeting_pipeline")
+_ALIGN = _load_core_module("align_audio_slides")
+VIDEO_EXTENSIONS: set[str] = set(_PIPELINE.VIDEO_EXTENSIONS)
+
+# align_audio_slides 现行参数（design §4.5: top-k、minimum-score 现参数）
+_LEXICAL_TOP_K = 5
+_LEXICAL_MIN_SCORE = 0.03
+
+# extract_video_slides.py 的 fail-fast 文案（T3 AUDIO_MISSING_MESSAGE，spec §5 行1）。
+# 镜像字符串而非 import：该脚本在模块级 require numpy/cv2，系统 python3 不可导入。
+_AUDIO_MISSING_MESSAGE = "录屏无声且事件内无独立音频文件:需要含声录屏或另配音频"
 
 # Safety margins
 RESERVE_MEMORY_GB = 2.0
@@ -87,15 +128,20 @@ def load_jsonl(path: Path) -> list[dict]:
 
 # --- Web-console observability (docs/web-console-design.md §4) ---------------
 # Canonical stage table for the console step bar; keys are stable contract —
-# webapp/server.py maps them to UI labels, tests pin the schema.
+# webapp/static/app.js (STAGE_KEYS) maps them to UI labels; webapp/server.py
+# only relays the keys, tests pin the schema.
+# 14 stations (screen-recording design §3.4): video_ingest 紧随 inventory、
+# slide_align 紧随 relevance；纯音频事件两站零开销跳过。
 STAGE_ORDER: list[tuple[str, str]] = [
     ("inventory", "文件清单"),
+    ("video_ingest", "视频分解（音轨/幻灯片）"),
     ("audio_prepare", "音频预处理（降噪）"),
     ("lang_probe", "语言探测"),
     ("asr", "语音识别"),
     ("literal", "组装逐句记录"),
     ("evidence", "生成证据"),
     ("relevance", "无关话语过滤"),
+    ("slide_align", "幻灯片对齐"),
     ("reconcile", "主题提取与索引"),
     ("audit", "claim 保真审计"),
     ("notes", "笔记佐证"),
@@ -209,33 +255,57 @@ def find_input_events() -> list[dict]:
     """Group input/ contents into events.
 
     Each first-level subdirectory is one event named after the directory.
-    Loose audio/notes files directly under input/ form one shared event named
-    "misc". This lets a user drop several lectures at once and have each
+    Loose audio/video/notes files directly under input/ form one shared event
+    named "misc". This lets a user drop several lectures at once and have each
     processed as its own meeting package.
+
+    Screen-recording design §3.4: an event forms when ANY of audio / notes /
+    video is present; video files join the event dict as "video" (sorted, so
+    multi-video events deterministically process the first — spec §5). The
+    extension whitelist is imported from meeting_pipeline, never duplicated.
     """
     audio_exts = {".m4a", ".mp3", ".wav", ".aac", ".flac", ".aiff", ".caf"}
     note_names = {"notes.md", "note.md"}
+    video_exts = VIDEO_EXTENSIONS
     events: list[dict] = []
-    loose_audio, loose_notes = [], None
+    loose_audio, loose_video, loose_notes = [], [], None
     INPUT_DIR.mkdir(parents=True, exist_ok=True)  # fresh clone: input/ not in git
     for entry in sorted(INPUT_DIR.iterdir(), key=lambda p: p.name):
         if entry.name.startswith("."):
             continue
         if entry.is_dir():
             audio = sorted(p for p in entry.iterdir() if p.suffix.lower() in audio_exts and not p.name.startswith("."))
+            video = sorted(p for p in entry.iterdir() if p.suffix.lower() in video_exts and not p.name.startswith("."))
             notes = next((p for p in entry.iterdir() if p.name.lower() in note_names), None)
-            if audio:
-                events.append({"name": entry.name, "dir": entry, "audio": audio, "notes": notes})
-            elif notes:
-                events.append({"name": entry.name, "dir": entry, "audio": [], "notes": notes})
+            if audio or video or notes:
+                events.append({"name": entry.name, "dir": entry, "audio": audio,
+                               "video": video, "notes": notes})
         elif entry.suffix.lower() in audio_exts:
             loose_audio.append(entry)
+        elif entry.suffix.lower() in video_exts:
+            loose_video.append(entry)
         elif entry.name.lower() in note_names:
             loose_notes = entry
-    if loose_audio or loose_notes:
-        events.append({"name": "misc", "dir": INPUT_DIR, "audio": loose_audio, "notes": loose_notes})
+    if loose_audio or loose_video or loose_notes:
+        events.append({"name": "misc", "dir": INPUT_DIR, "audio": loose_audio,
+                       "video": loose_video, "notes": loose_notes})
+    # The local console may save a user-confirmed candidate order for several
+    # independently processed meetings.  Invalid/stale plans are ignored, so
+    # no input is merged or fabricated merely to satisfy an ordering hint.
+    plan_path = INPUT_DIR / ".meeting-plan.json"
+    try:
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        order = plan.get("confirmed") if isinstance(plan, dict) else None
+        names = [e["name"] for e in events]
+        if isinstance(order, list) and sorted(order) == sorted(names):
+            rank = {name: i for i, name in enumerate(order)}
+            events.sort(key=lambda e: rank[e["name"]])
+    except (OSError, ValueError, TypeError):
+        pass
     if not events:
-        raise FileNotFoundError(f"input/ 中没有任何可处理内容（音频: {', '.join(sorted(audio_exts))}，笔记: notes.md）")
+        raise FileNotFoundError(
+            f"input/ 中没有任何可处理内容（音频: {', '.join(sorted(audio_exts))}，"
+            f"视频: {', '.join(sorted(video_exts))}，笔记: notes.md）")
     return events
 
 
@@ -245,6 +315,352 @@ def stage_inventory(run_dir: Path, source_dir: Path) -> Path:
     run(["python3", "-B", str(CORE / "scripts" / "meeting_pipeline.py"), "inventory",
          "--source", str(source_dir), "--output", str(manifest_path)])
     return manifest_path
+
+
+# --- 录屏摄取（docs/screen-recording-parsing-design.md §3.4） ----------------
+# 薄编排原则：算法全部在 core/scripts（detect_slide_region / extract_video_slides /
+# run_vision_ocr / suggest_ocr_corrections），本文件只做接线、决策表与降级语义。
+
+def _probe_duration(path: Path) -> float | None:
+    """ffprobe duration in seconds (None when unprobeable); mirrors the
+    detect_language probe pattern."""
+    try:
+        proc = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+             "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, timeout=30, check=False)
+        return float(proc.stdout.strip())
+    except (ValueError, subprocess.TimeoutExpired, OSError):
+        return None
+
+
+def _extract_audio_only(video: Path, out: Path) -> None:
+    """Degraded-branch audio extraction (ffmpeg -vn, copy 优先、aac 兜底).
+
+    Only used when the slide track is skipped (region unreliable) — the normal
+    path delegates audio to extract_video_slides.resolve_audio. Same decision-
+    table row and same fail-fast message as T3 (spec §2/§5).
+    """
+    out.parent.mkdir(parents=True, exist_ok=True)
+    tail = ""
+    for codec in (["-c:a", "copy"], ["-c:a", "aac"]):
+        proc = subprocess.run(
+            ["ffmpeg", "-nostdin", "-y", "-v", "error", "-i", str(video), "-vn",
+             *codec, str(out)],
+            capture_output=True, text=True, timeout=1800)
+        if proc.returncode == 0 and out.is_file() and out.stat().st_size > 0:
+            return
+        tail = proc.stderr.strip()[-300:]
+        out.unlink(missing_ok=True)  # never leave a partial audio artifact behind
+    raise RuntimeError(f"{_AUDIO_MISSING_MESSAGE}（ffmpeg 抽音轨失败: {tail}）")
+
+
+def _valid_region_file(path: Path, video_name: str) -> bool:
+    """region.json per design §4.1: object with an in-range relative rect bound
+    to THIS video's filename. Anything else (missing, malformed, out-of-range,
+    stale video binding) → CLI auto-detect fallback (spec §5 末行)."""
+    try:
+        region = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(region, dict):
+        return False
+    if Path(str(region.get("video") or "")).name != video_name:
+        return False
+    rect = region.get("rect")
+    if not isinstance(rect, dict):
+        return False
+    try:
+        x, y, w, h = (float(rect[k]) for k in ("x", "y", "w", "h"))
+    except (KeyError, TypeError, ValueError):
+        return False
+    return (0.0 <= x < 1.0 and 0.0 <= y < 1.0 and 0.0 < w <= 1.0 and 0.0 < h <= 1.0
+            and x + w <= 1.0 + 1e-6 and y + h <= 1.0 + 1e-6)
+
+
+def _next_source_index(files: list[dict]) -> int:
+    """First free F###### index after the inventory-issued source ids."""
+    highest = 0
+    for item in files:
+        match = re.fullmatch(r"F(\d{6})", str(item.get("source_id", "")))
+        if match:
+            highest = max(highest, int(match.group(1)))
+    return highest + 1
+
+
+def _derived_entry(source_id: str, kind: str, video_name: str, path: Path,
+                   relative_path: str, extra: dict | None = None) -> dict:
+    """One derived manifest entry (design §4.3).
+
+    `path` is ABSOLUTE by contract: derived media lives in runs/, not under
+    source_root, and prepare_audio resolves the override verbatim (T4).
+    """
+    import datetime as dt
+    entry = {
+        "source_id": source_id,
+        "relative_path": relative_path,
+        "kind": kind,
+        "extension": path.suffix.lower(),
+        "size_bytes": path.stat().st_size,
+        "modified_at": dt.datetime.fromtimestamp(
+            path.stat().st_mtime, dt.timezone.utc).astimezone().isoformat(),
+        "sha256": _PIPELINE.sha256_file(path),
+        "eligible_source": True,
+        "derived_from": video_name,
+        "path": str(path.resolve()),
+    }
+    entry.update(extra or {})
+    return entry
+
+
+def _inject_derived_entries(manifest_path: Path, run_dir: Path, video_name: str,
+                            audio_file: Path | None, audio_duration: float | None,
+                            slides: list[dict]) -> list[dict]:
+    """Append derived manifest entries (design §4.3), idempotently.
+
+    Retries reuse runs/<event>: previously injected derived entries are dropped
+    first and every aggregate field is recomputed from surviving originals +
+    fresh derived entries, so a second pass can never duplicate (spec §6
+    「manifest 派生条目追加幂等」). Returns the newly appended entries.
+    """
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    files = [item for item in manifest.get("files", []) if "derived_from" not in item]
+    next_index = _next_source_index(files)
+    derived: list[dict] = []
+    if audio_file is not None and audio_file.is_file():
+        derived.append(_derived_entry(
+            f"F{next_index:06d}", "audio", video_name, audio_file, audio_file.name,
+            extra={"media": {"duration_seconds": audio_duration}}))
+        next_index += 1
+    for slide in slides:
+        image_path = run_dir / "slides" / str(slide.get("image") or "")
+        if not image_path.is_file():
+            continue  # retracted/missing page: slides.json 与磁盘不一致时以磁盘为准
+        derived.append(_derived_entry(
+            f"F{next_index:06d}", "image", video_name, image_path,
+            f"slides/{image_path.name}",
+            extra={"page_id": slide.get("page_id"),
+                   "time_ranges": slide.get("time_ranges") or []}))
+        next_index += 1
+    files.extend(derived)
+    counts: dict[str, int] = {}
+    for item in files:
+        counts[item["kind"]] = counts.get(item["kind"], 0) + 1
+    manifest["files"] = files
+    manifest["file_count"] = len(files)
+    manifest["total_bytes"] = sum(item.get("size_bytes", 0) for item in files)
+    manifest["counts"] = counts
+    manifest["audio_duration_seconds"] = sum(
+        float((item.get("media") or {}).get("duration_seconds") or 0)
+        for item in files if item["kind"] == "audio")
+    atomic_json(manifest_path, manifest)
+    return derived
+
+
+def stage_video_ingest(run_dir: Path, manifest_path: Path, event: dict) -> dict | None:
+    """视频分解站（design §3.4）：区域 → 音轨 → 幻灯片 → OCR → manifest 派生条目.
+
+    Pure audio/notes events skip with zero artifacts and zero subprocess calls
+    (兼容边界 §7：纯音频路径行为与产物逐字节不变)。Returns the ingest receipt
+    dict, or None when the event has no video.
+
+    音轨决策表（§2，确定性）：
+      事件有独立音频        → --has-external-audio，视频音轨忽略（用户决策③分轨）
+      无独立音频 & 视频含声  → extracted_audio.m4a 注入 manifest 当普通音轨
+      无独立音频 & 视频无声  → fail-fast（§5 行1，源文件不动，输入保留）
+    """
+    ev = run_dir.name
+    videos = sorted(event.get("video") or [])
+    if not videos:
+        emit_progress(ev, "stage", "video_ingest", "无视频输入，跳过视频分解")
+        # Retry hygiene: the event's video was removed between runs. Run-1's
+        # artifacts (ingest_receipt slide_track=true, slides/, extracted audio)
+        # would misdirect later stations — the fresh inventory carries no
+        # derived entries, so _slide_image_evidence would raise a phantom
+        # 「缺少 manifest 派生条目（video_ingest 接线错误）」 on EVERY retry.
+        # Sweep them: a video-removed retry must behave exactly like a fresh
+        # pure-audio run (stage_slide_align then also sweeps stale relations).
+        stale_audio = run_dir / "extracted_audio.m4a"
+        if stale_audio.exists():
+            stale_audio.unlink()
+        for stale_dir in (run_dir / "video", run_dir / "slides"):
+            if stale_dir.is_dir():
+                shutil.rmtree(stale_dir, ignore_errors=True)
+        return None
+
+    warnings: list[str] = []
+    if len(videos) > 1:
+        # spec §5: v1 只处理按文件名排序的第一个视频
+        warnings.append("multiple_videos_first_only")
+    video_input = videos[0]
+    video_name = video_input.name
+    if len(videos) > 1:
+        emit_progress(ev, "stage", "video_ingest",
+                      f"多视频事件仅处理首个 {video_name}（其余 {len(videos) - 1} 个忽略）")
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    video_entry = next(
+        (item for item in manifest.get("files", [])
+         if item.get("kind") == "video"
+         and Path(str(item.get("relative_path") or "")).name == video_name), None)
+    has_audio = ((video_entry or {}).get("media") or {}).get("has_audio")
+    external_audio = bool(event.get("audio"))
+
+    # spec §5 行1 检测点（video_ingest 开头 ffprobe）：inventory 的 media 元数据
+    # 就是该 ffprobe 结果。无声且无独立音频 → 在产生任何工件之前 fail-fast。
+    if not external_audio and has_audio is False:
+        raise RuntimeError(_AUDIO_MISSING_MESSAGE)
+
+    source_copy = run_dir / "source" / video_name
+    video_path = source_copy if source_copy.is_file() else video_input
+    video_dir = run_dir / "video"
+
+    # -- 区域解析（§3.4 条目1 / §4.1 / §5 末两行） ---------------------------
+    emit_progress(ev, "stage", "video_ingest.probe", f"探测幻灯片区域（{video_name}）")
+    region_path = Path(event["dir"]) / "region.json"
+    region_confirmed = _valid_region_file(region_path, video_name)
+    if not region_confirmed:
+        if region_path.exists():
+            warnings.append("region_config_invalid_redetected")
+            log("  region.json 失效（视频绑定不匹配或格式非法）→ 重新自动检测")
+        auto_region = video_dir / "region.json"
+        proc = subprocess.run(
+            [str(TOOLS_PYTHON), "-B", str(CORE / "scripts" / "detect_slide_region.py"),
+             "--video", str(video_path),
+             "--preview-out", str(video_dir / "region-preview.png"),
+             "--result-out", str(video_dir / "detect_receipt.json"),
+             "--write-region", str(auto_region)],
+            capture_output=True, text=True, timeout=900, cwd=str(WORKSPACE))
+        if proc.returncode == 2:
+            # 未检出可信区域 → 幻灯片轨降级跳过；音频轨照常（spec §5 行2）
+            return _ingest_audio_only_degraded(
+                run_dir, manifest_path, video_path, video_name, video_entry,
+                external_audio, warnings)
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"detect_slide_region 失败 (exit {proc.returncode}): "
+                f"{(proc.stderr or proc.stdout)[-500:]}")
+        region_path = auto_region
+        warnings.append("region_auto_not_user_confirmed")
+        log("  ⚠ 幻灯片区域为自动检测（未经人工确认）——已标注进 receipt 与幻灯片元数据")
+    try:
+        region_source = str(json.loads(region_path.read_text(encoding="utf-8")).get("source") or "auto")
+    except (OSError, json.JSONDecodeError):
+        region_source = "auto"
+
+    # -- 视频分解（T3：音轨决策 + 流式抽帧 + 分段 + 去重，一次完成） ----------
+    emit_progress(ev, "stage", "video_ingest.audio",
+                  "音轨决策：事件含独立音频，视频音轨忽略（分轨处理）" if external_audio
+                  else "音轨决策：从视频抽取音轨（extracted_audio.m4a）")
+    emit_progress(ev, "stage", "video_ingest.frames", "流式抽帧 + 帧差分段（fps=1，内存有界）")
+    extract_cmd = [str(TOOLS_PYTHON), "-B", str(CORE / "scripts" / "extract_video_slides.py"),
+                   "--video", str(video_path),
+                   "--region-json", str(region_path),
+                   "--run-dir", str(run_dir)]
+    if external_audio:
+        # §2 决策表：独立音频优先，视频音轨忽略
+        extract_cmd.append("--has-external-audio")
+    # exit 2（无声且无独立音频）经 run() 的 RuntimeError 尾行浮出 §5 中文提示；
+    # T3 保证该路径零工件（run-dir 内不产生 slides/extracted_audio/receipt）。
+    run(extract_cmd, timeout=7200)
+
+    slides_doc = json.loads((run_dir / "slides" / "slides.json").read_text(encoding="utf-8"))
+    extract_receipt = json.loads((run_dir / "video" / "extract_receipt.json").read_text(encoding="utf-8"))
+    slides = slides_doc.get("slides") or []
+    for token in extract_receipt.get("warnings") or []:
+        if token not in warnings:
+            warnings.append(token)
+    slide_track = bool(slides)
+    audio_route = extract_receipt.get("audio_route")
+    audio_file = Path(extract_receipt["audio_extracted"]) if extract_receipt.get("audio_extracted") else None
+    audio_duration = extract_receipt.get("video_duration_s") if audio_route == "extracted" else None
+    emit_progress(ev, "stage", "video_ingest.segment",
+                  f"分段完成：{len(slides)} 页" + ("" if slide_track else "（幻灯片轨降级，见 warnings）"))
+    log(f"  视频分解完成: 音轨={audio_route}, 幻灯片={len(slides)} 页, 警告={warnings or '无'}")
+
+    # -- Vision OCR（幻灯片轨成立时；降级不致命，spec §5「OCR 单页失败」的工具级推广）
+    ocr_status = "skipped"
+    if slide_track:
+        emit_progress(ev, "stage", "video_ingest.ocr", "Apple Vision OCR（幻灯片代表帧）")
+        try:
+            run(["python3", "-B", str(CORE / "scripts" / "run_vision_ocr.py"),
+                 "--input-dir", str(run_dir / "slides"),
+                 "--output", str(run_dir / "slides" / "ocr.jsonl"),
+                 "--build-dir", str(video_dir / "ocr-build"),
+                 "--receipt", str(video_dir / "ocr_receipt.json")], timeout=3600)
+            ocr_status = "complete"
+        except (RuntimeError, subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
+            # degrade-never-kill (§5): non-zero exit (RuntimeError from run()),
+            # a hung swiftc/vision subprocess (TimeoutExpired), or a missing
+            # interpreter/binary (FileNotFoundError/OSError) all skip the OCR
+            # layer instead of killing an otherwise-good run.
+            ocr_status = "unavailable"
+            warnings.append("ocr_unavailable")
+            log(f"  ⚠ Vision OCR 失败，降级跳过（证据行文本置空并标注）: {str(exc)[:200]}")
+
+    derived = _inject_derived_entries(
+        manifest_path, run_dir, video_name,
+        audio_file if audio_route == "extracted" else None, audio_duration, slides)
+    receipt = {
+        "schema_version": 1,
+        "status": "complete" if not warnings else "degraded",
+        "video": video_name,
+        "video_source_id": (video_entry or {}).get("source_id"),
+        "region_source": region_source,
+        "region_confirmed_by_user": region_confirmed,
+        "audio_route": audio_route,
+        "audio_extracted": str(audio_file) if audio_file else None,
+        "slide_track": slide_track,
+        "pages": len(slides),
+        "ocr": ocr_status,
+        "derived_source_ids": [item["source_id"] for item in derived],
+        "warnings": warnings,
+    }
+    atomic_json(video_dir / "ingest_receipt.json", receipt)
+    return receipt
+
+
+def _ingest_audio_only_degraded(run_dir: Path, manifest_path: Path,
+                                video_path: Path, video_name: str,
+                                video_entry: dict | None, external_audio: bool,
+                                warnings: list[str]) -> dict:
+    """Region unreliable branch (spec §5 行2): slide track skipped, audio track
+    continues when possible. extract_video_slides requires a region, so this
+    one branch extracts audio directly (thin ffmpeg glue, same decision-table
+    row and fail-fast message as T3's resolve_audio)."""
+    ev = run_dir.name
+    warnings.append("region_unreliable_slide_track_skipped")
+    log("  ⚠ 未识别到可信幻灯片区域 → 幻灯片轨降级跳过（音频轨不受影响）")
+    audio_file: Path | None = None
+    audio_duration: float | None = None
+    if not external_audio:
+        emit_progress(ev, "stage", "video_ingest.audio", "未识别到幻灯片区域：跳过幻灯片轨，仅抽取音轨")
+        audio_file = run_dir / "extracted_audio.m4a"
+        _extract_audio_only(video_path, audio_file)
+        audio_duration = ((video_entry or {}).get("media") or {}).get("duration_seconds")
+        if audio_duration is None:
+            audio_duration = _probe_duration(audio_file)
+    else:
+        emit_progress(ev, "stage", "video_ingest.audio", "未识别到幻灯片区域：跳过幻灯片轨（事件已有独立音频）")
+    derived = _inject_derived_entries(manifest_path, run_dir, video_name,
+                                      audio_file, audio_duration, [])
+    receipt = {
+        "schema_version": 1,
+        "status": "degraded",
+        "video": video_name,
+        "video_source_id": (video_entry or {}).get("source_id"),
+        "region_source": "auto",
+        "region_confirmed_by_user": False,
+        "audio_route": "external" if external_audio else "extracted",
+        "audio_extracted": str(audio_file) if audio_file else None,
+        "slide_track": False,
+        "pages": 0,
+        "ocr": "skipped",
+        "derived_source_ids": [item["source_id"] for item in derived],
+        "warnings": warnings,
+    }
+    atomic_json(run_dir / "video" / "ingest_receipt.json", receipt)
+    return receipt
 
 
 def stage_audio_prepare(run_dir: Path, manifest: Path) -> None:
@@ -333,6 +749,15 @@ def stage_asr(run_dir: Path, manifest: Path) -> tuple[Path | None, Path | None]:
         if WHISPER_BIN.exists():
             emit_progress(ev, "stage", "asr.whisper", "whisper.cpp 交叉校验转录（auto）")
         whisper_json = _whisper_full_file(run_dir, None) if WHISPER_BIN.exists() else None
+
+    # Qwen3-ASR is an optional local enhancement.  Preserve a usable Whisper
+    # baseline when it is absent; never send audio elsewhere to compensate.
+    if QWEN_PYTHON is None or not QWEN_PYTHON.is_file():
+        if whisper_json is not None:
+            log("  ⚠ Qwen3-ASR 未安装：中文/混合语音使用 Whisper 基础模式，建议安装增强组件")
+            emit_progress(ev, "stage", "asr.qwen", "Qwen3-ASR 未安装，已降级为 Whisper 基础模式")
+            return None, whisper_json
+        raise RuntimeError("Qwen3-ASR 未安装，且 Whisper 基础转写不可用")
 
     # Qwen3-ASR segmented path (zh or mixed)
     log("  音频分段 (20s 窗口 × 3 音轨)...")
@@ -636,11 +1061,97 @@ def stage_literal_records(run_dir: Path, qwen_json: Path | None, whisper_json: P
     log(f"  生成 {len(records)} 条逐句记录 ({engine})")
     return output
 
+def _slide_image_evidence(run_dir: Path) -> list[dict]:
+    """Build I###### image evidence rows from video_ingest artifacts (design §4.4).
+
+    Returns [] when the slide track never stood up (pure-audio event, region
+    unreliable, segmentation-anomaly retraction) — stage_evidence output then
+    stays byte-identical to the classic audio-only behavior. OCR failures are
+    honest, never fatal: page text goes empty with an uncertainty annotation
+    (spec §5「OCR 单页失败」), and the coverage law downstream still holds.
+    """
+    receipt_path = run_dir / "video" / "ingest_receipt.json"
+    slides_path = run_dir / "slides" / "slides.json"
+    if not receipt_path.is_file() or not slides_path.is_file():
+        return []
+    try:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        slides_doc = json.loads(slides_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return []
+    if not receipt.get("slide_track"):
+        return []
+    slides = slides_doc.get("slides") or []
+    if not slides:
+        return []
+    video_name = slides_doc.get("video") or receipt.get("video")
+    manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    page_source = {item.get("page_id"): item.get("source_id")
+                   for item in manifest.get("files", [])
+                   if item.get("kind") == "image" and "derived_from" in item}
+    ocr_rows: dict[str, dict] = {}
+    ocr_path = run_dir / "slides" / "ocr.jsonl"
+    if ocr_path.is_file():
+        for line in ocr_path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if str(row.get("file") or ""):
+                ocr_rows[Path(str(row["file"])).stem] = row
+    rows: list[dict] = []
+    for index, slide in enumerate(slides, start=1):
+        page_id = slide.get("page_id") or f"P{index}"
+        source_id = page_source.get(page_id)
+        if not source_id:
+            # manifest injection is part of video_ingest; a missing mapping is
+            # an internal wiring bug — fail loud, never emit a dangling row.
+            raise RuntimeError(f"幻灯片页 {page_id} 缺少 manifest 派生条目（video_ingest 接线错误）")
+        stem = Path(str(slide.get("image") or f"{page_id}.png")).stem
+        ocr_row = ocr_rows.get(stem)
+        if ocr_row is None:
+            text = ""
+            confidence = {"route": "unavailable", "quality": "low"}
+            uncertainty = "ocr_unavailable: 幻灯片图像保留，无识别文本"
+        elif ocr_row.get("error"):
+            text = ""
+            confidence = {"route": "apple_vision", "quality": "low"}
+            uncertainty = f"ocr_page_failed: {ocr_row['error']}"
+        else:
+            text = "\n".join(
+                str(item.get("text") or "").strip()
+                for item in (ocr_row.get("items") or [])
+                if isinstance(item, dict) and str(item.get("text") or "").strip())
+            confidence = {"route": "apple_vision", "quality": "medium"}
+            uncertainty = None
+        rows.append({
+            "evidence_id": f"I{index:06d}",
+            "source_id": source_id,
+            "kind": "image",
+            "locator": {"page_id": page_id,
+                        "time_ranges": slide.get("time_ranges") or [],
+                        "video": video_name},
+            "literal_text": text,
+            "confidence": confidence,
+            "uncertainty": uncertainty,
+        })
+    return rows
+
+
 def stage_evidence(run_dir: Path, records_path: Path) -> Path:
     """Generate evidence JSONL aligned 1:1 with literal records.
 
     Evidence IDs reuse each record's own evidence_ids so downstream coverage
     checks (build_package_v3) can never see an ID mismatch.
+
+    Screen-recording extension (design §4.4): when video_ingest established a
+    slide track, I###### image rows are appended AFTER the audio rows, and an
+    audio-only sidecar (evidence/evidence_audio_only.jsonl) is written. v1
+    decision (§3.4): image rows never enter the reconcile view — relevance_filter
+    and quality_gate consume the sidecar instead. Pure-audio events write no
+    sidecar and their evidence.jsonl/receipt stay byte-identical to before.
     """
     log("Stage 5/9: 生成证据文件...")
     records = load_jsonl(records_path)
@@ -674,12 +1185,33 @@ def stage_evidence(run_dir: Path, records_path: Path) -> Path:
         }
         evidence.append(ev)
 
+    image_rows = _slide_image_evidence(run_dir)
+    audio_rows = evidence
+    evidence = evidence + image_rows
+
     output = evidence_dir / "evidence.jsonl"
     with open(output, "w", encoding="utf-8") as f:
         for e in evidence:
             f.write(json.dumps(e, ensure_ascii=False) + "\n")
 
-    atomic_json(evidence_dir / "evidence_receipt.json", {"status": "complete", "evidence_count": len(evidence), "engine": engine})
+    sidecar = evidence_dir / "evidence_audio_only.jsonl"
+    if image_rows:
+        # audio-only view for relevance_filter / quality_gate (v1 决定，§3.4)
+        with sidecar.open("w", encoding="utf-8") as f:
+            for e in audio_rows:
+                f.write(json.dumps(e, ensure_ascii=False) + "\n")
+    elif sidecar.exists():
+        # Retry hygiene: an earlier run established the slide track and this
+        # rerun degraded to zero image rows. Downstream consumes the sidecar
+        # "when present" and build_package_v3 would later SystemExit on the
+        # stale disposition coverage — so sweep it. Pure-audio runs never
+        # create it in the first place (byte-identity law).
+        sidecar.unlink()
+
+    receipt_payload: dict[str, Any] = {"status": "complete", "evidence_count": len(evidence), "engine": engine}
+    if image_rows:
+        receipt_payload["image_evidence_count"] = len(image_rows)
+    atomic_json(evidence_dir / "evidence_receipt.json", receipt_payload)
     return output
 
 
@@ -695,10 +1227,16 @@ def stage_relevance(run_dir: Path, records_path: Path, evidence_path: Path) -> t
     annotated = relevance_dir / "literal_records_annotated.jsonl"
     view = relevance_dir / "evidence_for_reconcile.jsonl"
     receipt = relevance_dir / "receipt.json"
+    # v1 决定（design §3.4）：evidence_for_reconcile 视图保持 AUDIO-ONLY。
+    # relevance_filter 原样透传输入证据行，故 video 事件在这里改喂 stage_evidence
+    # 产出的 audio-only 侧车文件（image 行永不进 reconcile 视图，run_ollama_reconcile
+    # 的按证据 ID 覆盖契约与 token 预算不受影响）。纯音频事件无侧车，命令与既往一致。
+    sidecar = run_dir / "evidence" / "evidence_audio_only.jsonl"
+    evidence_input = sidecar if sidecar.is_file() else evidence_path
     run(["python3", "-B", str(CORE / "scripts" / "relevance_filter.py"),
          "--records", str(records_path),
          "--records-out", str(annotated),
-         "--evidence", str(evidence_path),
+         "--evidence", str(evidence_input),
          "--evidence-for-reconcile", str(view),
          "--receipt", str(receipt),
          "--ollama-url", OLLAMA_URL,
@@ -710,6 +1248,127 @@ def stage_relevance(run_dir: Path, records_path: Path, evidence_path: Path) -> t
     except (OSError, json.JSONDecodeError):
         pass
     return annotated, view
+
+
+def _spans_intersect(start: float, end: float, time_ranges: list) -> bool:
+    """Closed-interval intersection between one record span and a slide's
+    time_ranges (design §4.5: 确定性求交，无阈值调参). Malformed ranges are
+    skipped, never fatal."""
+    for pair in time_ranges or []:
+        try:
+            r_start, r_end = float(pair[0]), float(pair[1])
+        except (IndexError, TypeError, ValueError):
+            continue
+        if start <= r_end and end >= r_start:
+            return True
+    return False
+
+
+def stage_slide_align(run_dir: Path, evidence_path: Path, records_path: Path) -> Path | None:
+    """幻灯片对齐站（design §3.4/§4.5）：产出 relations/final.jsonl.
+
+    Runs only when the slide track stood up; pure-audio events return None and
+    stage_build_package's empty-relations placeholder stays in charge (classic
+    path byte-identical). v1 relation 一律 "unknown"（未经 LLM 分类，诚实标注，
+    铁律 #2/#6）；decision_route 记录候选来源：
+      temporal_overlap  音频抽自同一视频（时间轴同源）→ 时间段确定性求交
+      lexical           独立音频文件（时间轴不同源）→ align_audio_slides 的
+                        CJK-compact bigram 相似度（top-k/minimum-score 现参数）
+    COVERAGE LAW (build_package_v3 SystemExit 防线): every image evidence id
+    appears in exactly one row — pages without candidates still get a row with
+    candidate_audio_records=[].
+    """
+    ev = run_dir.name
+    receipt_path = run_dir / "video" / "ingest_receipt.json"
+    receipt: dict = {}
+    if receipt_path.is_file():
+        try:
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            receipt = {}
+    evidence = load_jsonl(evidence_path)
+    image_rows = [row for row in evidence if row.get("kind") == "image"]
+    if not receipt.get("slide_track") or not image_rows:
+        emit_progress(ev, "stage", "slide_align", "无幻灯片轨，跳过对齐")
+        # Retry hygiene (same standard as the stage_evidence sidecar sweep):
+        # an established run-1 left REAL relations behind; on a degraded rerun
+        # they would ride --relations into build_package_v3 and SystemExit on
+        # the coverage mismatch — every retry would fail. Sweep them so the
+        # classic empty placeholder in stage_build_package takes over.
+        stale_dir = run_dir / "relations"
+        for stale in (stale_dir / "final.jsonl", stale_dir / "slide_align_receipt.json"):
+            if stale.exists():
+                stale.unlink()
+        return None
+    records = load_jsonl(records_path)
+    route = "temporal_overlap" if receipt.get("audio_route") == "extracted" else "lexical"
+    log(f"幻灯片对齐: {len(image_rows)} 页 × {len(records)} 条记录（route={route}）...")
+
+    relations: list[dict] = []
+    for index, row in enumerate(image_rows, start=1):
+        slide_text = str(row.get("literal_text") or "")
+        time_ranges = (row.get("locator") or {}).get("time_ranges") or []
+        candidates: list[dict] = []
+        if route == "temporal_overlap":
+            for record in records:
+                try:
+                    start, end = float(record["start_seconds"]), float(record["end_seconds"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if _spans_intersect(start, end, time_ranges):
+                    candidates.append({
+                        "record_id": record["record_id"],
+                        "lexical_score": round(_ALIGN.similarity(
+                            slide_text, record.get("clean_literal") or ""), 4),
+                    })
+            candidates.sort(key=lambda item: item["record_id"])
+        else:
+            ranked = sorted(
+                ((_ALIGN.similarity(slide_text, record.get("clean_literal") or ""), record)
+                 for record in records),
+                key=lambda pair: (-pair[0], pair[1]["record_id"]))
+            candidates = [{"record_id": record["record_id"], "lexical_score": round(score, 4)}
+                          for score, record in ranked[:_LEXICAL_TOP_K]
+                          if score >= _LEXICAL_MIN_SCORE]
+        relations.append({
+            "relation_id": f"R{index:06d}",
+            "slide_source_id": row["source_id"],
+            "slide_evidence_ids": [row["evidence_id"]],
+            "candidate_audio_records": candidates,
+            "relation": "unknown",
+            "decision_route": route,
+        })
+
+    all_image_ids = {row["evidence_id"] for row in image_rows}
+    union = {eid for relation in relations for eid in relation["slide_evidence_ids"]}
+    if union != all_image_ids:
+        # coverage law self-check: never hand build_package_v3 a partial set.
+        # Regression guard only — relations are constructed 1:1 from
+        # image_rows above, so this can fire only if that construction is
+        # ever edited without preserving the coverage law.
+        raise RuntimeError(
+            f"slide_align 覆盖铁律被破坏: relations 覆盖 {len(union)}/{len(all_image_ids)} 个 image 证据 ID")
+
+    relations_dir = run_dir / "relations"
+    relations_dir.mkdir(parents=True, exist_ok=True)
+    output = relations_dir / "final.jsonl"
+    with open(output, "w", encoding="utf-8") as f:
+        for relation in relations:
+            f.write(json.dumps(relation, ensure_ascii=False) + "\n")
+    atomic_json(relations_dir / "slide_align_receipt.json", {
+        "schema_version": 1,
+        "status": "complete",
+        "decision_route": route,
+        "relation_count": len(relations),
+        "image_evidence_count": len(all_image_ids),
+        "candidate_audio_record_count": len({c["record_id"] for r in relations
+                                             for c in r["candidate_audio_records"]}),
+        "coverage_complete": True,
+        "relation_decisions_final": False,  # v1: relation=unknown，未经 LLM 分类
+        "content_included": False,
+    })
+    log(f"  生成 {len(relations)} 行 relations（覆盖全部 image 证据；relation=unknown 未分类）")
+    return output
 
 
 def stage_reconcile(run_dir: Path, evidence_path: Path) -> Path:
@@ -781,6 +1440,46 @@ def stage_notes(run_dir: Path, notes_path: Path, manifest_path: Path, records_pa
     return notes_dir / "note_relations_safe.jsonl" if (notes_dir / "note_relations_safe.jsonl").exists() else notes_dir / "note_relations.jsonl"
 
 
+def _suggest_ocr_corrections(run_dir: Path) -> Path | None:
+    """OCR 标注式修正建议（design §3.3/§4.6，用户决策⑤：ASR 原文永不静默改写）.
+
+    Runs only when slide OCR exists; 0 corrections is a normal pass (T5 honest
+    gate). ANY failure degrades to a warning — the audit station must never
+    kill an otherwise-good run (spec §5). The --evidence-map is built from this
+    run's own I###### image rows so correction rows carry ocr_evidence_id.
+    """
+    ocr_jsonl = run_dir / "slides" / "ocr.jsonl"
+    records_path = run_dir / "literal_records.jsonl"
+    if not ocr_jsonl.is_file() or not records_path.is_file():
+        return None
+    evidence = load_jsonl(run_dir / "evidence" / "evidence.jsonl")
+    map_path = run_dir / "video" / "ocr_evidence_map.jsonl"
+    with open(map_path, "w", encoding="utf-8") as f:
+        # JSONL rows {page_id, evidence_id} — the shape suggest_ocr_corrections
+        # reads (page stem like "P3" → image evidence id).
+        for row in evidence:
+            if row.get("kind") == "image":
+                page_id = (row.get("locator") or {}).get("page_id")
+                if page_id:
+                    f.write(json.dumps({"page_id": page_id,
+                                        "evidence_id": row["evidence_id"]},
+                                       ensure_ascii=False) + "\n")
+    output = run_dir / "ocr_corrections.jsonl"
+    try:
+        run([str(TOOLS_PYTHON), "-B", str(CORE / "scripts" / "suggest_ocr_corrections.py"),
+             "--records", str(records_path),
+             "--slides-ocr", str(ocr_jsonl),
+             "--output", str(output),
+             "--receipt", str(run_dir / "video" / "ocr_corrections_receipt.json"),
+             "--evidence-map", str(map_path)], timeout=1800)
+    except (RuntimeError, subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
+        # degrade-never-kill (§5): covers a deleted tools-venv
+        # (FileNotFoundError) and a hung subprocess (TimeoutExpired) too.
+        log(f"  ⚠ OCR 修正建议生成失败，降级跳过（不影响审计结果）: {str(exc)[:200]}")
+        return None
+    return output
+
+
 def stage_audit_claims(run_dir: Path, reconciled_path: Path) -> Path:
     """Claim-fidelity audit + repair (antonym reversals, silent garble fixes,
     invented intent, citation gaps). Repairs claims strictly from cited
@@ -798,16 +1497,38 @@ def stage_audit_claims(run_dir: Path, reconciled_path: Path) -> Path:
     summary = json.loads(receipt.read_text(encoding="utf-8"))
     log(f"  审计 {summary['audited']} 条: 首轮忠实 {summary['faithful_first_pass']}, "
         f"修复 {summary['repaired']}, 残留 {summary['residual']}")
+    corrections = _suggest_ocr_corrections(run_dir)
+    if corrections is not None:
+        count = sum(1 for line in corrections.read_text(encoding="utf-8").splitlines() if line.strip())
+        log(f"  OCR 修正建议: {count} 条（标注式证据，ASR 原文不改写）")
     return output
 
 
 def merge_excluded_dispositions(run_dir: Path, reconciled_path: Path, annotated_path: Path,
                                 evidence_path: Path) -> Path:
-    """Give logistics-excluded evidence an explicit disposition.
+    """Give logistics-excluded evidence AND slide image rows an explicit disposition.
 
-    build_package_v3 requires dispositions to cover every evidence id; the
-    reconcile ran on the filtered view, so excluded ids are added here with
-    status 'excluded_logistics' — documented in 05, never silently dropped.
+    Real constraints that force this merge (all committed behavior):
+    (a) build_package_v3.py:70-71 SystemExits unless the disposition id-set
+        equals the full evidence id-set — the reconcile ran on the filtered
+        AUDIO-ONLY view, so ids excluded from it (or never in it) would crash
+        the package build if left undisposed.
+    (b) build_package_v3.py:150 renders ONLY dispositions with status in
+        {uncertain, conflict} into 《05_不确定与冲突》 — a status outside
+        that set (e.g. a hypothetical "slide_layer") would silently hide the
+        row from every human-facing surface (铁律 #6).
+    (c) the committed disposition enum is covered/duplicate/nonsemantic/
+        uncertain/conflict (run_ollama_reconcile.py:43), and that schema
+        REQUIRES a 'reason' string — image rows therefore carry both
+        'reason' (what 05 renders) and 'note' (same text, machine-facing).
+
+    Screen-recording v1 (§3.4): image rows (I######) are outside the
+    reconcile view by design; they are marked 'uncertain' with the honest
+    explanation rendered in 05 — slide-audio correspondence is unclassified
+    in v1, which belongs on the uncertainty surface. Logistics-excluded ids
+    keep the classic 'excluded_logistics' entries byte-identical to the
+    12-station behavior (golden-pinned). Pure-audio events with no
+    exclusions keep the classic early-return path.
     """
     receipt = run_dir / "relevance" / "receipt.json"
     if not receipt.is_file():
@@ -816,22 +1537,33 @@ def merge_excluded_dispositions(run_dir: Path, reconciled_path: Path, annotated_
         excluded_records = set(json.loads(receipt.read_text(encoding="utf-8"))["excluded_ids"])
     except (OSError, json.JSONDecodeError, KeyError):
         return reconciled_path
-    if not excluded_records:
+    evidence = load_jsonl(evidence_path)
+    image_ids = {e["evidence_id"] for e in evidence if e.get("kind") == "image"}
+    if not excluded_records and not image_ids:
         return reconciled_path
     annotated = load_jsonl(annotated_path)
-    evidence = load_jsonl(evidence_path)
     covered_by_records = {e for rec in annotated if rec["record_id"] in excluded_records
                           for e in rec.get("evidence_ids", [])}
     reconciled = json.loads(Path(reconciled_path).read_text(encoding="utf-8"))
     have = {d.get("evidence_id") for d in reconciled.get("dispositions", [])}
     all_ids = {e["evidence_id"] for e in evidence}
     for eid in sorted(all_ids - have):
-        reconciled.setdefault("dispositions", []).append({
-            "evidence_id": eid,
-            "status": "excluded_logistics" if eid in covered_by_records else "unreconciled",
-            "note": "excluded from topic reconcile by relevance filter" if eid in covered_by_records
-                    else "not covered by reconcile chunks",
-        })
+        if eid in image_ids:
+            explanation = ("slide image evidence: audio-only reconcile view by design (v1); "
+                           "participates via relations / 03_PPT补充信息")
+            reconciled.setdefault("dispositions", []).append({
+                "evidence_id": eid,
+                "status": "uncertain",
+                "reason": explanation,   # rendered in 05 (build_package_v3.py:150)
+                "note": explanation,
+            })
+        else:
+            reconciled.setdefault("dispositions", []).append({
+                "evidence_id": eid,
+                "status": "excluded_logistics" if eid in covered_by_records else "unreconciled",
+                "note": "excluded from topic reconcile by relevance filter" if eid in covered_by_records
+                        else "not covered by reconcile chunks",
+            })
     merged = run_dir / "reconciled" / "reconciled_merged.json"
     merged.write_text(json.dumps(reconciled, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return merged
@@ -841,7 +1573,9 @@ def stage_build_package(run_dir: Path, evidence_path: Path, records_path: Path, 
     """Build the full package: index, report, database."""
     log("Stage 8/9: 构建完整报告包...")
     
-    # Create empty slide relations if none exist
+    # Create empty slide relations if none exist. Screen-recording events:
+    # stage_slide_align already wrote the REAL relations/final.jsonl, so this
+    # placeholder only ever triggers for pure-audio events (design §7 退休路径).
     relations_dir = run_dir / "relations"
     relations_dir.mkdir(parents=True, exist_ok=True)
     slide_relations = relations_dir / "final.jsonl"
@@ -852,14 +1586,30 @@ def stage_build_package(run_dir: Path, evidence_path: Path, records_path: Path, 
     
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    # Build v3 package
-    run(["python3", "-B", str(CORE / "scripts/build_package_v3.py"),
-         "--evidence", str(evidence_path),
-         "--literal-record", str(records_path),
-         "--relations", str(slide_relations),
-         "--reconciled", str(reconciled_path),
-         "--output-dir", str(output_dir)],
-        timeout=600)
+    # Build v3 package. Slide track status (design §3.4) gates the optional
+    # --slides-dir/--ocr-corrections flags; pure-audio events pass neither and
+    # build_package_v3's default output stays byte-identical (T4 pins).
+    slide_track = False
+    ingest_doc: dict = {}
+    try:
+        ingest_doc = json.loads(
+            (run_dir / "video" / "ingest_receipt.json").read_text(encoding="utf-8"))
+        slide_track = bool(ingest_doc.get("slide_track")) \
+            and (run_dir / "slides" / "slides.json").is_file()
+    except (OSError, json.JSONDecodeError):
+        slide_track = False
+    cmd = ["python3", "-B", str(CORE / "scripts/build_package_v3.py"),
+           "--evidence", str(evidence_path),
+           "--literal-record", str(records_path),
+           "--relations", str(slide_relations),
+           "--reconciled", str(reconciled_path),
+           "--output-dir", str(output_dir)]
+    if slide_track:
+        cmd += ["--slides-dir", str(run_dir / "slides")]
+    corrections = run_dir / "ocr_corrections.jsonl"
+    if slide_track and corrections.is_file():
+        cmd += ["--ocr-corrections", str(corrections)]
+    run(cmd, timeout=600)
     
     # Also render note corroboration
     if note_relations_path.exists():
@@ -871,8 +1621,7 @@ def stage_build_package(run_dir: Path, evidence_path: Path, records_path: Path, 
              "--receipt", str(output_dir / "note_render_receipt.json")])
     
     # Generate usage guide
-    guide = output_dir / "00_使用说明.md"
-    guide.write_text("\n".join([
+    guide_lines = [
         "# 使用说明",
         "",
         "- 问演讲者具体说了什么：查《02_逐句会议记录》。",
@@ -881,7 +1630,27 @@ def stage_build_package(run_dir: Path, evidence_path: Path, records_path: Path, 
         "- 低置信度内容：查《05_不确定与冲突.md》。",
         "- 笔记佐证：查《06_笔记佐证与冲突.md》。",
         "- AI 检索：使用 meeting.db 或 query_meeting.py。",
-    ]), encoding="utf-8")
+    ]
+    if slide_track:
+        # design §3.4: one navigation line, ONLY when the slide layer exists.
+        # It lives here (not in build_package_v3.py) because this override is
+        # the console package's final 00_使用说明.md; the pure-audio list above
+        # stays byte-identical to the classic guide (golden-pinned in
+        # tests/test_run_meeting_video.py).
+        guide_lines.insert(3, "- 问 PPT 页面内容/对应发言：查《03_PPT补充信息》与 幻灯片/ 目录。")
+    # 报告标注 (design §3.4 item1 / §5 行2): the unconfirmed-auto-region and
+    # degraded-no-region cases must be marked inside outputs/. Placed after
+    # the nav line (end of the guide). Pure-audio events have no ingest
+    # receipt → no annotation → guide bytes identical to the classic golden.
+    if slide_track and "region_auto_not_user_confirmed" in (ingest_doc.get("warnings") or []):
+        # Keyed on the ingest WARNING TOKEN (not region_source): the token is
+        # emitted only when the CLI-fallback detect actually ran, so an
+        # off-schema hand-made region.json lacking "source" can never mistrigger.
+        guide_lines.append("幻灯片区域为自动检测，未经人工确认。")
+    elif not slide_track and "region_unreliable_slide_track_skipped" in (ingest_doc.get("warnings") or []):
+        guide_lines.append("未识别到幻灯片区域，本次仅处理音轨。")
+    guide = output_dir / "00_使用说明.md"
+    guide.write_text("\n".join(guide_lines), encoding="utf-8")
 
 
 def stage_validate(package_dir: Path, run_dir: Path) -> bool:
@@ -903,11 +1672,20 @@ def stage_validate(package_dir: Path, run_dir: Path) -> bool:
     gate_script = CORE / "scripts" / "quality_gate.py"
     if gate_script.exists():
         gate_report = package_dir / "quality_gate_report.json"
+        gate_cmd = ["python3", "-B", str(gate_script),
+                    "--run-dir", str(run_dir),
+                    "--package-dir", str(package_dir),
+                    "--output", str(gate_report)]
+        audio_only = run_dir / "evidence" / "evidence_audio_only.jsonl"
+        if audio_only.is_file():
+            # Screen-recording v1 (§3.4): image rows (I######) are outside the
+            # literal-record citation graph by design; the gate's alignment
+            # check must see the same audio-only evidence layer the reconcile
+            # saw, or it would flag every slide row as an orphan. Pure-audio
+            # events have no sidecar — the classic invocation is unchanged.
+            gate_cmd += ["--evidence", str(audio_only)]
         gate = subprocess.run(
-            ["python3", "-B", str(gate_script),
-             "--run-dir", str(run_dir),
-             "--package-dir", str(package_dir),
-             "--output", str(gate_report)],
+            gate_cmd,
             capture_output=True, text=True, timeout=180
         )
         if gate.returncode == 0:
@@ -952,10 +1730,16 @@ def process_event(event: dict, args) -> bool:
         dest = source_dir / af.name
         if not dest.exists():
             shutil.copy2(af, dest)
+    for vf in event.get("video") or []:
+        dest = source_dir / vf.name
+        if not dest.exists():
+            shutil.copy2(vf, dest)
     if event["notes"]:
         shutil.copy2(event["notes"], source_dir / event["notes"].name)
 
     manifest = stage_inventory(run_dir, source_dir)
+    emit_progress(name, "stage", "video_ingest", "视频分解（音轨/幻灯片）")
+    stage_video_ingest(run_dir, manifest, event)
     emit_progress(name, "stage", "audio_prepare", "音频预处理（arnndn RNN 降噪）")
     stage_audio_prepare(run_dir, manifest)
 
@@ -971,6 +1755,8 @@ def process_event(event: dict, args) -> bool:
     evidence_path = stage_evidence(run_dir, records_path)
     emit_progress(name, "stage", "relevance", "无关话语过滤（只标注不删除）")
     annotated_path, reconcile_view = stage_relevance(run_dir, records_path, evidence_path)
+    emit_progress(name, "stage", "slide_align", "幻灯片对齐")
+    stage_slide_align(run_dir, evidence_path, annotated_path)
     emit_progress(name, "stage", "reconcile", "主题提取与索引构建（Ollama）")
     reconciled_path = stage_reconcile(run_dir, reconcile_view)
     emit_progress(name, "stage", "audit", "claim 保真审计")
@@ -1016,8 +1802,9 @@ def main():
     failures = []
     try:
         for event in events:
+            video_note = f"，{len(event['video'])} 个视频" if event.get("video") else ""
             emit_progress(event["name"], "event_start",
-                          message=f"开始处理（{len(event['audio'])} 个音频，笔记{'有' if event['notes'] else '无'}）")
+                          message=f"开始处理（{len(event['audio'])} 个音频{video_note}，笔记{'有' if event['notes'] else '无'}）")
             try:
                 if not process_event(event, args):
                     failures.append(event["name"])
@@ -1037,7 +1824,7 @@ def main():
             for event in events:
                 if event["name"] in failures:
                     continue
-                for item in event["audio"] + ([event["notes"]] if event["notes"] else []):
+                for item in event["audio"] + (event.get("video") or []) + ([event["notes"]] if event["notes"] else []):
                     try:
                         item.unlink(missing_ok=True) if item.is_file() else None
                     except OSError:

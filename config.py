@@ -17,11 +17,16 @@ ROOT = Path(__file__).resolve().parent
 SPEC = {
     "whisper_bin":   ("MST_WHISPER_BIN",   True,  None),
     "whisper_model": ("MST_WHISPER_MODEL", True,  None),
-    "qwen_python":   ("MST_QWEN_PYTHON",   True,  None),
+    # Optional enhancement for Chinese/mixed ASR. Whisper remains the
+    # baseline so a fresh local install can process English without it.
+    "qwen_python":   ("MST_QWEN_PYTHON",   False, None),
     "ollama_url":    ("MST_OLLAMA_URL",    False, "http://127.0.0.1:11434"),
     "ollama_model":  ("MST_OLLAMA_MODEL",  False, "qwen3:8b"),
     "ffmpeg":        ("MST_FFMPEG",        False, None),
     "whisper_root":  ("MST_WHISPER_ROOT",  False, None),
+    # Interpreter of vendor/tools-venv (numpy/cv2/pypinyin helpers used by the
+    # screen-recording module); optional — scripts fall back to this default.
+    "tools_python":  ("MST_TOOLS_PYTHON",  False, str(ROOT / "vendor" / "tools-venv" / "bin" / "python")),
 }
 
 _PRIVATE_FILE = ROOT / "config.json"

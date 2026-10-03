@@ -54,12 +54,22 @@ def main() -> int:
 
     for item in audio_items:
         source_id = item["source_id"]
+        # Derived media (e.g. audio extracted from a screen recording) lives in
+        # runs/, not under source_root; such manifest items carry an absolute
+        # "path" override (design §4.3) instead of relying on join quirks.
+        source = Path(item["path"]) if item.get("path") else source_root / item["relative_path"]
+        if item.get("path") and not source.is_absolute():
+            # A relative override would silently resolve against the CWD and
+            # segment the wrong file; fail loud instead (review 2026-09-30).
+            raise SystemExit(
+                f"manifest path override must be absolute: {item['source_id']}: {item['path']}"
+            )
         normalized = args.prepared_run / "artifacts/audio/normalized" / f"{source_id}.wav"
         enhanced = args.prepared_run / "artifacts/audio/enhanced" / f"{source_id}.wav"
         with wave.open(str(normalized), "rb") as reader:
             duration = reader.getnframes() / reader.getframerate()
         routes = {
-            "original": source_root / item["relative_path"],
+            "original": source,
             "normalized": normalized,
             "impulse_noise_reduced": enhanced,
         }

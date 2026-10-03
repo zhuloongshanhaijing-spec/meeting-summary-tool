@@ -28,7 +28,7 @@ is not bundled or downloaded by this repository.
 Clone and check the test suite (no models needed yet):
 
 ```bash
-python3 -m unittest discover tests   # expect: OK (27 tests)
+python3 -m unittest discover tests   # expect: OK
 ```
 
 ## 2. whisper.cpp (required — ASR base engine)
@@ -62,7 +62,7 @@ needs the Qwen3-ASR engine (window mode) with whisper as cross-check:
 
 ```bash
 python3 -m venv qwen-asr-venv
-qwen-asr-venv/bin/pip install torch transformers accelerate
+qwen-asr-venv/bin/pip install torch transformers accelerate qwen-asr
 # offline model cache: export HF_HUB_OFFLINE=1 after pre-downloading
 # Qwen/Qwen3-ASR-1.7B
 ```
@@ -85,7 +85,9 @@ cp config.example.json config.json
 `config.json` is gitignored — it is the only file that ever holds your
 local paths. Every key can also come from an env var (`MST_WHISPER_BIN`,
 `MST_WHISPER_MODEL`, `MST_QWEN_PYTHON`, `MST_OLLAMA_URL`, `MST_OLLAMA_MODEL`).
-Missing keys produce one collective error listing everything.
+The web console can open before these are ready and shows a local dependency
+checklist; required items unlock processing, while Qwen3-ASR and video tools
+are optional enhancements.
 
 ## 6. Run the web console (or the CLI)
 
@@ -94,7 +96,10 @@ python3 start.py            # web console at http://127.0.0.1:8788 (auto-opens)
 python3 run_meeting.py      # one serial CLI pass over input/ (unchanged v0.1 behavior)
 ```
 
-The console binds to 127.0.0.1 only (no auth — keep it local). See
+The console binds to 127.0.0.1 only (no auth — keep it local). For recording
+videos, `./setup.sh` also creates `vendor/tools-venv` with NumPy, OpenCV and
+pypinyin. The page asks you to confirm an automatically detected slide region
+before a video batch starts. See
 PRIVACY_AND_DATA_FLOW.md for the `_private` visibility semantics across
 MCP / CLI / web.
 

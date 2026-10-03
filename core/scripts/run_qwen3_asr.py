@@ -25,7 +25,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
-    parser.add_argument("--model", default="Qwen/Qwen3-ASR-0.6B")
+    parser.add_argument("--model", default="Qwen/Qwen3-ASR-1.7B")
     parser.add_argument("--language", default="Chinese")
     parser.add_argument("--device", choices=("auto", "mps", "cpu"), default="auto")
     parser.add_argument("--context", default="")

@@ -117,7 +117,16 @@ def main() -> int:
     for item in manifest["files"]:
         if item.get("kind") != "audio":
             continue
-        source = source_root / item["relative_path"]
+        # Derived media (e.g. audio extracted from a screen recording) lives in
+        # runs/, not under source_root; such manifest items carry an absolute
+        # "path" override (design §4.3) instead of relying on join quirks.
+        source = Path(item["path"]) if item.get("path") else source_root / item["relative_path"]
+        if item.get("path") and not source.is_absolute():
+            # A relative override would silently resolve against the CWD and
+            # transcribe the wrong file; fail loud instead (review 2026-09-30).
+            raise SystemExit(
+                f"manifest path override must be absolute: {item['source_id']}: {item['path']}"
+            )
         cache_file = cache_dir / f"{item['source_id']}.json"
         if not args.force and cache_file.is_file():
             try:

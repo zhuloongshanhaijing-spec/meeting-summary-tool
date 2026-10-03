@@ -8,21 +8,12 @@ line shape, sub-stage index mapping, best-effort failure semantics, and the
 from __future__ import annotations
 
 import json
-import os
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
 WS = Path(__file__).resolve().parents[1]
-
-# run_meeting resolves config at import time; this module must pass when run
-# standalone (python3 -m unittest tests.test_progress_hook), not only as part
-# of full discovery where test_engine_arbitration happened to seed these.
-for _k, _v in {"MST_WHISPER_BIN": "/dummy/whisper-cli",
-               "MST_WHISPER_MODEL": "/dummy/model.bin",
-               "MST_QWEN_PYTHON": "/dummy/python"}.items():
-    os.environ.setdefault(_k, _v)
 
 import run_meeting
 
@@ -54,10 +45,13 @@ class EmitProgressTest(unittest.TestCase):
         self.assertEqual(snap["stage_total"], len(run_meeting.STAGE_ORDER))
 
     def test_substage_maps_to_parent_index(self):
-        # "asr" is the 4th step; sub-stages must not invent new positions
-        self.assertEqual(run_meeting._stage_index("asr.qwen"), 4)
-        self.assertEqual(run_meeting._stage_index("asr.whisper"), 4)
+        # "asr" is the 5th step of the 14-station table (screen-recording
+        # design §3.4); sub-stages must not invent new positions
+        self.assertEqual(run_meeting._stage_index("asr.qwen"), 5)
+        self.assertEqual(run_meeting._stage_index("asr.whisper"), 5)
         self.assertEqual(run_meeting._stage_index("inventory"), 1)
+        self.assertEqual(run_meeting._stage_index("video_ingest.ocr"), 2)
+        self.assertEqual(run_meeting._stage_index("slide_align"), 9)
         self.assertEqual(run_meeting._stage_index(""), 0)
 
     def test_stage_started_advances_on_stage_change(self):
@@ -109,12 +103,15 @@ class ResolveOutputDirTest(unittest.TestCase):
 
 
 class StageOrderContractTest(unittest.TestCase):
-    def test_twelve_unique_keys(self):
+    def test_fourteen_unique_keys(self):
         keys = [k for k, _ in run_meeting.STAGE_ORDER]
-        self.assertEqual(len(keys), 12)
-        self.assertEqual(len(set(keys)), 12)
-        # order pinned by the spec's step bar
-        self.assertEqual(keys[:4], ["inventory", "audio_prepare", "lang_probe", "asr"])
+        self.assertEqual(len(keys), 14)
+        self.assertEqual(len(set(keys)), 14)
+        # order pinned by the spec's step bar (screen-recording design §3.4:
+        # video_ingest 紧随 inventory、slide_align 紧随 relevance)
+        self.assertEqual(keys[:5], ["inventory", "video_ingest", "audio_prepare",
+                                    "lang_probe", "asr"])
+        self.assertEqual(keys[keys.index("relevance") + 1], "slide_align")
         self.assertEqual(keys[-1], "validate")
 
 

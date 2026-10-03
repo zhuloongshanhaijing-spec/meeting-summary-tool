@@ -13,12 +13,14 @@
 #   3. whisper.cpp：克隆进 vendor/、cmake 编译、下模型 large-v3-turbo-q5_0
 #   4. Qwen3-ASR venv：vendor/qwen-asr-venv + torch/transformers/accelerate
 #      + 预下载 HF 模型 Qwen/Qwen3-ASR-1.7B（--no-qwen-model 可跳过）
-#   5. 生成 config.json（已存在则保留不动——它是你的私有文件）
-#   6. ./install.sh 装全局启动器 mst + PATH
-#   7. 起一次服务实测 /api/status，全链路预检通过才报成功
+#   5. tools-venv：vendor/tools-venv + numpy / opencv-python-headless /
+#      pypinyin（录屏幻灯片帧处理 + OCR 修正建议；start.py 预检需要它）
+#   6. 生成 config.json（已存在则保留不动——它是你的私有文件）
+#   7. ./install.sh 装全局启动器 mst + PATH
+#   8. 起一次服务实测 /api/status，全链路预检通过才报成功
 #
 # 三方依赖统一收在本仓库 vendor/ 下（固定区域，已 gitignore）。
-# 跳过项：MST_SETUP_SKIP="ollama whisper qwen" ./setup.sh（空格分隔）
+# 跳过项：MST_SETUP_SKIP="ollama whisper qwen tools" ./setup.sh（空格分隔）
 set -u
 
 REPO=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
@@ -27,6 +29,7 @@ W_BIN="$VENDOR/whisper.cpp/build/bin/whisper-cli"
 W_MODEL_NAME="ggml-large-v3-turbo-q5_0.bin"
 W_MODEL="$VENDOR/whisper.cpp/models/$W_MODEL_NAME"
 QVENV="$VENDOR/qwen-asr-venv"
+TVENV="$VENDOR/tools-venv"
 SKIP=${MST_SETUP_SKIP:-}
 want_qwen_model=1
 [ "${1:-}" = "--no-qwen-model" ] && want_qwen_model=0
@@ -38,7 +41,7 @@ die()  { printf '  ✗ %s\n' "$1" >&2; exit 1; }
 has_skip() { case " $SKIP " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 
 # ---- 0. 前置 --------------------------------------------------------------
-step "0/7 前置检查"
+step "0/8 前置检查"
 [ "$(uname)" = "Darwin" ] || die "本装配器面向 macOS（当前: $(uname)）"
 command -v git >/dev/null 2>&1 || die "缺 git（先装 Xcode Command Line Tools: xcode-select --install）"
 command -v python3 >/dev/null 2>&1 || die "缺 python3（xcode-select --install 或 brew install python@3.12）"
@@ -54,14 +57,14 @@ fi
 ok "macOS / python $PYV / git / Homebrew 就绪"
 
 # ---- 1. ffmpeg + cmake ----------------------------------------------------
-step "1/7 ffmpeg + cmake（音频预处理 / 编译工具）"
+step "1/8 ffmpeg + cmake（音频预处理 / 编译工具）"
 if command -v ffmpeg >/dev/null 2>&1; then ok "ffmpeg 已有: $(command -v ffmpeg)"
 else brew install ffmpeg || die "brew install ffmpeg 失败"; ok "ffmpeg 已安装"; fi
 if command -v cmake >/dev/null 2>&1; then ok "cmake 已有"
 else brew install cmake || die "brew install cmake 失败"; ok "cmake 已安装"; fi
 
 # ---- 2. Ollama + qwen3:8b ---------------------------------------------------
-step "2/7 Ollama + qwen3:8b（本地 LLM 阶段）"
+step "2/8 Ollama + qwen3:8b（本地 LLM 阶段）"
 if has_skip ollama; then warn "按 MST_SETUP_SKIP 跳过 ollama"
 elif command -v ollama >/dev/null 2>&1; then ok "ollama 已有"
 else brew install ollama || die "brew install ollama 失败"; ok "ollama 已安装"; fi
@@ -82,7 +85,7 @@ if ! has_skip ollama; then
 fi
 
 # ---- 3. whisper.cpp --------------------------------------------------------
-step "3/7 whisper.cpp + 模型 ${W_MODEL_NAME}（ASR 基座）"
+step "3/8 whisper.cpp + 模型 ${W_MODEL_NAME}（ASR 基座）"
 if has_skip whisper; then warn "按 MST_SETUP_SKIP 跳过 whisper"
 else
     mkdir -p -- "$VENDOR"
@@ -106,15 +109,15 @@ else
 fi
 
 # ---- 4. Qwen3-ASR venv -------------------------------------------------------
-step "4/7 Qwen3-ASR venv（中文/混说 ASR，推荐）"
+step "4/8 Qwen3-ASR venv（中文/混说 ASR，推荐）"
 if has_skip qwen; then warn "按 MST_SETUP_SKIP 跳过 qwen venv"
-elif [ -x "$QVENV/bin/python" ] && "$QVENV/bin/python" -c "import torch, transformers, accelerate" >/dev/null 2>&1; then
+elif [ -x "$QVENV/bin/python" ] && "$QVENV/bin/python" -c "import torch, transformers, accelerate, qwen_asr" >/dev/null 2>&1; then
     ok "venv 已就绪: $QVENV"
 else
     python3 -m venv "$QVENV" || die "创建 venv 失败"
     "$QVENV/bin/pip" install --upgrade pip >/dev/null || die "pip 升级失败"
-    printf '  … 安装 torch / transformers / accelerate（体积较大，请耐心）\n'
-    "$QVENV/bin/pip" install torch transformers accelerate \
+    printf '  … 安装 torch / transformers / accelerate / qwen-asr（体积较大，请耐心）\n'
+    "$QVENV/bin/pip" install torch transformers accelerate qwen-asr \
         || die "pip 安装失败（网络/磁盘？）重跑 ./setup.sh 续装"
     ok "venv 依赖安装完成"
 fi
@@ -127,8 +130,25 @@ print("  ✓ HF 模型缓存就绪")
 PYEOF
 fi
 
-# ---- 5. config.json ----------------------------------------------------------
-step "5/7 config.json（只在缺失时生成，绝不覆盖你的现有配置）"
+# ---- 5. tools-venv ------------------------------------------------------------
+step "5/8 tools-venv（录屏幻灯片帧处理 + OCR 修正建议：numpy / opencv / pypinyin）"
+if has_skip tools; then warn "按 MST_SETUP_SKIP 跳过 tools venv（start.py 预检会要求它，编译前需补装）"
+elif [ -x "$TVENV/bin/python" ] && "$TVENV/bin/python" -c "import numpy, cv2, pypinyin" >/dev/null 2>&1; then
+    ok "venv 已就绪: $TVENV"
+else
+    mkdir -p -- "$VENDOR"
+    python3 -m venv "$TVENV" || die "创建 tools-venv 失败"
+    "$TVENV/bin/pip" install --upgrade pip >/dev/null || die "pip 升级失败"
+    printf '  … 安装 numpy / opencv-python-headless / pypinyin\n'
+    "$TVENV/bin/pip" install numpy opencv-python-headless pypinyin \
+        || die "pip 安装失败（网络/磁盘？）重跑 ./setup.sh 续装"
+    "$TVENV/bin/python" -c "import numpy, cv2, pypinyin" >/dev/null 2>&1 \
+        || die "tools-venv 依赖自检失败（import numpy, cv2, pypinyin）"
+    ok "tools-venv 依赖安装完成"
+fi
+
+# ---- 6. config.json ----------------------------------------------------------
+step "6/8 config.json（只在缺失时生成，绝不覆盖你的现有配置）"
 if [ -f "$REPO/config.json" ]; then
     ok "config.json 已存在，保留不动（如需重置：rm config.json 后重跑）"
 else
@@ -144,12 +164,12 @@ print("  ✓ config.json 已生成（全部指向 vendor/，已 gitignore）")
 PYEOF
 fi
 
-# ---- 6. 全局启动器 -------------------------------------------------------------
-step "6/7 全局启动器 mst"
+# ---- 7. 全局启动器 -------------------------------------------------------------
+step "7/8 全局启动器 mst"
 sh "$REPO/install.sh" || die "install.sh 失败"
 
-# ---- 7. 实测起服 ----------------------------------------------------------------
-step "7/7 起服实测（预检全过 + /api/status 200 才算装配成功）"
+# ---- 8. 实测起服 ----------------------------------------------------------------
+step "8/8 起服实测（预检全过 + /api/status 200 才算装配成功）"
 PORT=18877
 LOG=$(mktemp /tmp/mst-setup-verify.XXXXXX)
 python3 "$REPO/start.py" --no-browser --port "$PORT" > "$LOG" 2>&1 &

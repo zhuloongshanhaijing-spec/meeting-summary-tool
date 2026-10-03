@@ -1,11 +1,12 @@
 """Unit tests for start.py — the one-command launcher.
 
-Covers the preflight chain (config / ffmpeg / binaries / memory / Ollama),
-the lazy run_meeting import, the argparse surface, and the serve path
-(port-in-use → friendly hint + exit 1, Ctrl+C → clean stop). Everything is
-hermetic: config resolution is pointed at temp paths, fake binaries are
-touched + chmod 755 inside a TemporaryDirectory, and urlopen / Popen are
-mocked — the real Ollama app is never launched and no real port is bound.
+Covers the preflight chain (config / ffmpeg / binaries / tools-venv /
+memory / Ollama), the lazy run_meeting import, the argparse surface, and
+the serve path (port-in-use → friendly hint + exit 1, Ctrl+C → clean stop).
+Everything is hermetic: config resolution is pointed at temp paths, fake
+binaries are touched + chmod 755 inside a TemporaryDirectory, and urlopen /
+Popen are mocked — the real Ollama app is never launched and no real port
+is bound.
 """
 from __future__ import annotations
 
@@ -39,7 +40,7 @@ def mst_cleared_env() -> dict:
 def fake_toolchain(tmp: Path) -> dict:
     """A fully valid cfg dict backed by temp files (touch + chmod 755)."""
     cfg = {}
-    for name in ("whisper_bin", "qwen_python", "ffmpeg"):
+    for name in ("whisper_bin", "qwen_python", "tools_python", "ffmpeg"):
         p = tmp / name
         p.write_bytes(b"#!/bin/sh\nexit 0\n")
         p.chmod(0o755)
@@ -89,9 +90,9 @@ class CheckConfigTest(unittest.TestCase):
                 cfg, err = start.check_config()
         self.assertIsNone(cfg)
         self.assertIsNotNone(err)
-        for token in ("whisper_bin", "MST_WHISPER_BIN",
-                      "whisper_model", "qwen_python"):
+        for token in ("whisper_bin", "MST_WHISPER_BIN", "whisper_model"):
             self.assertIn(token, err)
+        self.assertNotIn("qwen_python", err)
 
 
 class CheckFfmpegTest(unittest.TestCase):
@@ -124,6 +125,73 @@ class CheckBinariesTest(unittest.TestCase):
             failures = start.check_binaries(cfg)
         self.assertEqual(len(failures), 1)
         self.assertIn("whisper_model", failures[0])
+
+
+class CheckToolsPythonTest(unittest.TestCase):
+    """tools-venv 预检：cfg["tools_python"]（config.py 可选键，resolve 后即
+    env MST_TOOLS_PYTHON > config.json > 默认 vendor 路径）→ env → 仓库默认
+    <repo>/vendor/tools-venv/bin/python；缺失的可执行文件走既有合并报错并
+    指向 ./setup.sh。"""
+
+    def _fake_python(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"#!/bin/sh\nexit 0\n")
+        path.chmod(0o755)
+
+    def test_present_passes_missing_fails(self):
+        with tempfile.TemporaryDirectory() as td:
+            cfg = fake_toolchain(Path(td))
+            self.assertIsNone(start.check_tools_python(cfg))  # fake executable ok
+            missing = str(Path(td) / "no-tools-python")
+            cfg["tools_python"] = missing
+            failure = start.check_tools_python(cfg)
+        self.assertIsNotNone(failure)
+        self.assertIn("tools_python", failure)
+        self.assertIn(missing, failure)
+        self.assertIn("setup.sh", failure)
+
+    def test_env_fallback_when_cfg_key_absent(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            fake = tmp / "env-tools-python"
+            self._fake_python(fake)
+            empty_root = tmp / "empty-root"   # 无 vendor/：默认路径必须落空，
+            empty_root.mkdir()                # 否则本仓库真实 venv 会掩盖 env 回退缺失
+            env = {**mst_cleared_env(), "MST_TOOLS_PYTHON": str(fake)}
+            with mock.patch.object(start, "ROOT", empty_root), \
+                 mock.patch.dict(os.environ, env, clear=True):
+                self.assertIsNone(start.check_tools_python({}))
+
+    def test_default_vendor_path_fallback(self):
+        """cfg/env 都缺 → 解析到 <repo>/vendor/tools-venv/bin/python。"""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            default = root / "vendor" / "tools-venv" / "bin" / "python"
+            with mock.patch.object(start, "ROOT", root), \
+                 mock.patch.dict(os.environ, mst_cleared_env(), clear=True):
+                failure = start.check_tools_python({})      # venv 未装配
+            self.assertIsNotNone(failure)
+            self.assertIn(str(default), failure)
+            self._fake_python(default)
+            with mock.patch.object(start, "ROOT", root), \
+                 mock.patch.dict(os.environ, mst_cleared_env(), clear=True):
+                self.assertIsNone(start.check_tools_python({}))
+
+    def test_missing_joins_collective_run_check_failures(self):
+        """合并报错机制：其余全绿、仅 tools-venv 缺 → run_checks 收集到它。"""
+        with tempfile.TemporaryDirectory() as td:
+            cfg = fake_toolchain(Path(td))
+            cfg["tools_python"] = str(Path(td) / "no-tools-python")
+            with mock.patch.object(config, "resolve", return_value=cfg), \
+                 mock.patch("urllib.request.urlopen"), \
+                 mock.patch.object(start, "memory_info",
+                                   return_value={"total_gb": 16.0,
+                                                 "available_gb": 8.0}), \
+                 mock.patch.object(subprocess, "Popen"):
+                failures = start.run_checks()
+        self.assertEqual(len(failures), 1)
+        self.assertIn("tools_python", failures[0])
+        self.assertIn("setup.sh", failures[0])
 
 
 class LazyRunMeetingTest(unittest.TestCase):
@@ -205,12 +273,12 @@ class ServeWebTest(unittest.TestCase):
 
 
 class MainWiringTest(unittest.TestCase):
-    def test_failures_abort_before_serving(self):
+    def test_missing_dependencies_still_serve_recovery_console(self):
         with mock.patch.object(start, "run_checks",
                                return_value=["缺 whisper_bin"]), \
-             mock.patch.object(start, "serve_web") as serve:
-            self.assertEqual(start.main([]), 1)
-        serve.assert_not_called()
+             mock.patch.object(start, "serve_web", return_value=0) as serve:
+            self.assertEqual(start.main([]), 0)
+        serve.assert_called_once_with(None, True)
 
     def test_green_checks_serve(self):
         with mock.patch.object(start, "run_checks", return_value=[]), \

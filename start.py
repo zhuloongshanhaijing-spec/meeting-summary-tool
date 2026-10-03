@@ -9,8 +9,10 @@ missing piece never hides another); any ✗ aborts before a port is bound:
   b. ffmpeg                found via PATH (or cfg["ffmpeg"] override)
   c. whisper-cli + ggml    binary executable, model file non-empty
   d. qwen venv python      executable
-  e. memory                run_meeting.check_memory(), informational only
-  f. Ollama                GET /api/tags; on miss `open -a Ollama` + poll
+  e. tools venv python     executable (vendor/tools-venv: numpy/cv2/pypinyin,
+                           cfg["tools_python"] or MST_TOOLS_PYTHON override)
+  f. memory                run_meeting.check_memory(), informational only
+  g. Ollama                GET /api/tags; on miss `open -a Ollama` + poll
 
 run_meeting.py resolves config at import time, so it is imported lazily —
 only after the config check has passed. Importing this module has no side
@@ -21,6 +23,7 @@ from __future__ import annotations
 import argparse
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -84,13 +87,38 @@ def check_binaries(cfg: dict) -> list[str]:
         failures.append(f"whisper_model 不存在或为空文件: {model}"
                         "（检查 config.json 或环境变量 MST_WHISPER_MODEL）")
 
-    qwen = Path(cfg["qwen_python"])
-    if qwen.is_file() and os.access(qwen, os.X_OK):
-        ok(f"qwen python: {qwen}")
+    qwen_value = cfg.get("qwen_python")
+    if qwen_value:
+        qwen = Path(qwen_value)
+        if qwen.is_file() and os.access(qwen, os.X_OK):
+            ok(f"qwen python: {qwen}")
+        else:
+            # Optional Chinese/mixed enhancement: report it without blocking
+            # the Whisper baseline.
+            log(f"⚠ qwen_python 不可用，中文/混合语音将使用 Whisper 基础模式: {qwen}")
     else:
-        failures.append(f"qwen_python 不存在或不可执行: {qwen}"
-                        "（Qwen3-ASR venv 的解释器，环境变量 MST_QWEN_PYTHON）")
+        log("⚠ 未配置 qwen_python，中文/混合语音将使用 Whisper 基础模式")
     return failures
+
+
+def check_tools_python(cfg: dict | None = None) -> str | None:
+    """tools-venv interpreter (numpy/cv2/pypinyin for the screen-recording
+    slide stages). config.py exposes the optional `tools_python` key, so
+    cfg["tools_python"] is already env(MST_TOOLS_PYTHON) > config.json >
+    default ROOT/vendor/tools-venv/bin/python; the env/default fallbacks
+    here keep the check working with hand-built cfg dicts (tests). A miss
+    joins the same collective friendly error as whisper_bin/qwen_python and
+    points at ./setup.sh."""
+    target = ((cfg or {}).get("tools_python")
+              or os.environ.get("MST_TOOLS_PYTHON")
+              or str(ROOT / "vendor" / "tools-venv" / "bin" / "python"))
+    path = Path(target)
+    if path.is_file() and os.access(path, os.X_OK):
+        ok(f"tools-venv python: {path}")
+        return None
+    return (f"tools_python 不存在或不可执行: {path}"
+            "（幻灯片工具 venv 的解释器；运行 ./setup.sh 装配 tools-venv，"
+            "或检查 config.json tools_python / 环境变量 MST_TOOLS_PYTHON）")
 
 
 def memory_info() -> dict:
@@ -149,6 +177,10 @@ def run_checks() -> list[str]:
         ok(f"ffmpeg: {shutil.which(cfg.get('ffmpeg') or 'ffmpeg')}")
 
     failures.extend(check_binaries(cfg))
+
+    tools_miss = check_tools_python(cfg)
+    if tools_miss:
+        failures.append(tools_miss)
 
     mem = memory_info()
     log(f"内存: 共 {mem.get('total_gb', 0):.0f} GB，可用 "
@@ -210,21 +242,53 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="网页端口（默认 8788，或环境变量 MST_WEB_PORT）")
     parser.add_argument("--no-browser", action="store_true",
                         help="启动后不自动打开浏览器")
+    parser.add_argument("--stop", action="store_true",
+                        help="一键结束运行中的控制台（按端口定位并优雅退出；"
+                             "正在编译的子进程不受影响，下次启动会经 pidfile 继续对账）")
     return parser.parse_args(argv)
+
+
+def stop_console(port: int | None) -> int:
+    """Find the console listening on `port` and SIGTERM it (graceful path)."""
+    import subprocess as _sp
+    wanted = port or int(os.environ.get("MST_WEB_PORT") or 8788)
+    try:
+        out = _sp.run(["lsof", "-nP", f"-iTCP:{wanted}", "-sTCP:LISTEN", "-t"],
+                      capture_output=True, text=True, timeout=10)
+    except (OSError, _sp.TimeoutExpired):
+        log(f"✗ 无法执行 lsof，请手动结束端口 {wanted} 上的进程")
+        return 1
+    pids = [p for p in out.stdout.split() if p.isdigit()]
+    if not pids:
+        log(f"端口 {wanted} 上没有运行中的控制台")
+        return 0
+    for pid in pids:
+        try:
+            os.kill(int(pid), signal.SIGTERM)
+        except OSError as exc:
+            log(f"✗ 结束进程 {pid} 失败：{exc}")
+            return 1
+    for _ in range(50):  # 最多等 5s 让其干净退出
+        time.sleep(0.1)
+        try:
+            os.kill(int(pids[0]), 0)
+        except OSError:
+            break
+    else:
+        log("进程未在 5s 内退出，请检查端口占用")
+        return 1
+    log(f"✓ 控制台已结束（端口 {wanted}，进程 {' '.join(pids)}）")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    log("预检开始")
-    try:
-        failures = run_checks()
-    except KeyboardInterrupt:
-        log("已取消（Ctrl+C）")
-        return 130
-    if failures:
-        report_failures(failures)
-        return 1
-    ok("预检全部通过，启动网页控制台")
+    if args.stop:
+        return stop_console(args.port)
+    # The console is also the recovery surface for a fresh clone.  Do not make
+    # a missing model/venv prevent the user from seeing the local installer.
+    # Compilation itself remains gated by /api/dependencies.
+    log("启动本地控制台（依赖状态将在网页中检查）")
     return serve_web(args.port or None, not args.no_browser)
 
 

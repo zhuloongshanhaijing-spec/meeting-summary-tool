@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import sqlite3
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -29,12 +30,32 @@ def main() -> int:
     parser.add_argument("--relations", required=True, type=Path)
     parser.add_argument("--reconciled", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
+    # Optional screen-recording inputs (design §3.4/§4.7); when both are
+    # absent every output file stays byte-identical to the classic behavior.
+    parser.add_argument(
+        "--ocr-corrections", type=Path,
+        help="optional ocr_corrections.jsonl; rendered as advisory annotations only",
+    )
+    parser.add_argument(
+        "--slides-dir", type=Path,
+        help="optional directory of P*.png + slides.json copied into the package as 幻灯片/",
+    )
     args = parser.parse_args()
 
     evidence = read_jsonl(args.evidence)
     records = read_jsonl(args.literal_record)
     relations = read_jsonl(args.relations)
     reconciled = json.loads(args.reconciled.read_text(encoding="utf-8"))
+    corrections: list[dict[str, Any]] = []
+    if args.ocr_corrections is not None and args.ocr_corrections.is_file():
+        corrections = read_jsonl(args.ocr_corrections)
+    corrections_by_record: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for correction in corrections:
+        corrections_by_record[correction.get("record_id")].append(correction)
+    known_record_ids = {row["record_id"] for row in records}
+    unmatched_corrections = sum(
+        1 for correction in corrections if correction.get("record_id") not in known_record_ids
+    )
     units = reconciled.get("units") or []
     dispositions = reconciled.get("dispositions") or []
     evidence_by_id = {item["evidence_id"]: item for item in evidence}
@@ -60,8 +81,12 @@ def main() -> int:
     for source_id, rows in sorted(source_records.items()):
         literal_lines += [f"## 音频来源 {source_id}", ""]
         for row in rows:
+            heading = f"### {row['record_id']} · {stamp(row.get('start_seconds'))}–{stamp(row.get('end_seconds'))} · {row.get('certainty', 'unrated')}"
+            # OCR 修正只作渲染层标注（决策⑤）：clean_literal 原文永不改写。
+            for correction in corrections_by_record.get(row["record_id"], []):
+                heading += f" 〔OCR建议: {correction.get('original')}→{correction.get('suggested')} ({correction.get('ocr_page_id')})〕"
             literal_lines += [
-                f"### {row['record_id']} · {stamp(row.get('start_seconds'))}–{stamp(row.get('end_seconds'))} · {row.get('certainty', 'unrated')}",
+                heading,
                 "",
                 row.get("clean_literal") or "[听不清]",
                 f"- 证据：{', '.join(row.get('evidence_ids') or [])}",
@@ -133,6 +158,13 @@ def main() -> int:
         )
     if not uncertain:
         uncertain_lines.append("自动校验未登记未解决冲突；这不代表百分之百准确。")
+    if corrections:
+        uncertain_lines += ["", "## OCR 修正建议（录屏幻灯片证据）", ""]
+        for correction in corrections:
+            uncertain_lines.append(
+                f"- 原词「{correction.get('original')}」→ 候选「{correction.get('suggested')}」"
+                f"（证据 [{correction.get('ocr_page_id')}]，依据 {correction.get('basis')}）"
+            )
     (args.output_dir / "05_不确定与冲突.md").write_text("\n".join(uncertain_lines) + "\n", encoding="utf-8")
 
     usage_lines = [
@@ -142,6 +174,24 @@ def main() -> int:
         "- 低置信度内容：查《05_不确定与冲突》。", "",
     ]
     (args.output_dir / "00_使用说明.md").write_text("\n".join(usage_lines), encoding="utf-8")
+
+    # Slide evidence layer (design §4.7): copy representative frames + slides.json
+    # into the package. Only runs when --slides-dir is passed; the classic
+    # audio-only call never creates 幻灯片/ and never touches the artifacts list.
+    slides_copied = False
+    if args.slides_dir is not None and args.slides_dir.is_dir():
+        slides_target = args.output_dir / "幻灯片"
+        # Idempotent re-runs into the same output dir: drop stale pages from a
+        # previous build first (mirrors the meeting.db unlink below).
+        shutil.rmtree(slides_target, ignore_errors=True)
+        slides_target.mkdir(parents=True, exist_ok=True)
+        for image in sorted(args.slides_dir.glob("P*.png")):
+            if image.is_file():
+                shutil.copy2(image, slides_target / image.name)
+        slides_meta = args.slides_dir / "slides.json"
+        if slides_meta.is_file():
+            shutil.copy2(slides_meta, slides_target / "slides.json")
+        slides_copied = True
 
     database = args.output_dir / "meeting.db"
     if database.exists():
@@ -193,6 +243,12 @@ def main() -> int:
         "artifacts": ["00_使用说明.md", "01_主题索引.md", "02_逐句会议记录.md", "03_PPT补充信息.md", "04_会议报告.md", "05_不确定与冲突.md", "meeting.db", "coverage_receipt.json"],
         "uncertainty_count": len(uncertain), "archive_status": "not_applied", "content_level_supervision": False,
     }
+    if slides_copied:
+        completion["artifacts"].append("幻灯片/")
+    if corrections:
+        # record_ids that matched no rendered 02 record line were skipped
+        # silently (annotation-only surface); the count stays auditable here.
+        completion["ocr_correction_unmatched"] = unmatched_corrections
     (args.output_dir / "completion_receipt.json").write_text(json.dumps(completion, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(args.output_dir / "completion_receipt.json")
     return 0

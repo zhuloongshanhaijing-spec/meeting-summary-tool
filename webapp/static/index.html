@@ -10,12 +10,17 @@
 <body>
 
 <div id="offline" class="offline" role="status" hidden>连接已断开，正在重试…</div>
+<div id="quit-hint" class="quit-hint" role="status" hidden>
+  ✓ 本地控制台已关闭 —— 本页已失效，可关闭此标签页。重新启动：终端运行 <code>mst</code>
+</div>
 
 <main class="wrap">
 
   <header class="masthead">
     <h1>会议知识编译台</h1>
     <div class="mast-right">
+      <button id="btn-quit" class="btn-quit" type="button"
+              title="关闭本地控制台服务（编译中的任务会先确认）">⏻ 关闭服务</button>
       <span id="pid" class="pid num" hidden></span>
       <span id="badge" class="badge badge-idle" role="status" aria-label="运行状态：空闲">
         <i class="bdot" aria-hidden="true"></i><span id="badge-text">空闲</span>
@@ -23,14 +28,25 @@
     </div>
   </header>
 
+  <section class="panel" aria-labelledby="h-deps">
+    <h2 id="h-deps">本地依赖自检</h2>
+    <p class="dim">会议材料始终留在本机。安装只会在你点击后执行本地 <code>setup.sh</code>。</p>
+    <div id="dependencies"></div>
+  </section>
+
+  <section class="panel" aria-labelledby="h-candidates">
+    <h2 id="h-candidates">多会议候选分组与顺序</h2>
+    <div id="candidates" class="dim">尚未发现候选会议。</div>
+  </section>
+
   <section class="panel" aria-labelledby="h-drop">
     <h2 id="h-drop">投放材料</h2>
     <div class="drops">
       <div class="drop-col">
         <div class="drop" id="drop-audio" role="button" tabindex="0"
-             aria-label="投放录音文件：把文件拖到这里，或按回车键选择文件，支持多选">
-          <p class="drop-title">把录音文件拖到这里，或点击选择</p>
-          <p class="drop-hint num">m4a · mp3 · wav · aac · flac · aiff · caf</p>
+             aria-label="投放录音或录屏文件：把文件拖到这里，或按回车键选择文件，支持多选">
+          <p class="drop-title">把录音 / 录屏文件拖到这里，或点击选择</p>
+          <p class="drop-hint num">m4a · mp3 · wav · aac · flac · aiff · caf · 录屏 mp4 · mov · mkv · webm · m4v</p>
         </div>
         <ul class="filelist" id="list-audio" aria-label="已选录音文件"></ul>
       </div>
@@ -44,7 +60,7 @@
       </div>
     </div>
     <input type="file" id="pick-audio" class="pick" multiple
-           accept=".m4a,.mp3,.wav,.aac,.flac,.aiff,.caf" hidden>
+           accept=".m4a,.mp3,.wav,.aac,.flac,.aiff,.caf,.mp4,.mov,.mkv,.webm,.m4v" hidden>
     <input type="file" id="pick-notes" class="pick" multiple
            accept=".md,.markdown,.txt" hidden>
     <div class="controls">
@@ -56,6 +72,7 @@
         <span class="ctl-l">输出目录</span>
         <input type="text" id="output-dir" placeholder="默认 outputs/，或点「选择」挑文件夹" autocomplete="off" spellcheck="false">
       </label>
+      <label class="ctl"><span class="ctl-l"><input id="fragment-mode" type="checkbox"> 散乱多会议片段：每个媒体文件独立解析</span></label>
       <button id="btn-pick-dir" class="btn btn-ghost" type="button" aria-label="打开系统对话框选择输出文件夹">选择…</button>
       <button id="btn-start" class="btn btn-primary" type="button">开始编译</button>
       <button id="btn-stop" class="btn btn-stop" type="button" hidden>停止</button>
@@ -93,6 +110,41 @@
   <footer class="foot">本地流水线 · 数据不出本机 · 产物写入 outputs/</footer>
 
 </main>
+
+<!-- 录屏区域确认弹窗（规格 §3.6）：预览帧 + 叠加检测框，内容与状态由 app.js 驱动 -->
+<div id="region-modal" class="modal-backdrop" role="dialog" aria-modal="true"
+     aria-labelledby="region-modal-title" hidden>
+  <div class="modal">
+    <div class="modal-head">
+      <h3 id="region-modal-title">确认幻灯片区域</h3>
+      <span id="region-modal-event" class="modal-event dim"></span>
+      <button id="region-modal-x" class="frm modal-x" type="button" aria-label="关闭弹窗">×</button>
+    </div>
+    <div id="region-modal-error" class="modal-error" role="alert" hidden></div>
+    <div id="region-modal-warn" class="modal-warn" hidden></div>
+    <div id="region-work" class="modal-work">
+      <div class="spinner" aria-hidden="true"></div>
+      <p>正在检测幻灯片区域（最长约 2 分钟，请耐心等待）…</p>
+    </div>
+    <div class="region-frame">
+      <div id="region-stage" class="region-stage" hidden>
+        <img id="region-preview" alt="录屏预览帧，叠加幻灯片检测框" draggable="false" hidden>
+        <div id="region-box" class="region-box" hidden>
+          <span class="rh rh-nw" data-corner="nw"></span>
+          <span class="rh rh-ne" data-corner="ne"></span>
+          <span class="rh rh-sw" data-corner="sw"></span>
+          <span class="rh rh-se" data-corner="se"></span>
+        </div>
+      </div>
+    </div>
+    <p class="modal-hint"><span id="region-hint"></span> <span id="region-readout" class="num"></span></p>
+    <div class="modal-foot">
+      <button id="region-retry" class="btn btn-ghost" type="button" hidden>重试检测</button>
+      <button id="region-adopt" class="btn btn-ghost" type="button" disabled>采纳自动检测</button>
+      <button id="region-confirm" class="btn btn-primary" type="button" disabled>确认区域</button>
+    </div>
+  </div>
+</div>
 
 <div id="toasts" class="toasts" aria-live="polite"></div>
 

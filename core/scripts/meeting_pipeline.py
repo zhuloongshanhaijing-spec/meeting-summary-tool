@@ -12,6 +12,7 @@ import argparse
 import datetime as dt
 import hashlib
 import json
+import math
 import os
 import platform
 import re
@@ -45,6 +46,7 @@ DEFAULT_STAGES = [
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".heic", ".tif", ".tiff", ".webp"}
 AUDIO_EXTENSIONS = {".m4a", ".mp3", ".wav", ".aac", ".flac", ".aiff", ".caf"}
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".m4v"}
 NOTE_EXTENSIONS = {".txt", ".md", ".pdf", ".doc", ".docx", ".ppt", ".pptx"}
 BAD_TEXT_PATTERNS = ("\ufffd", "\\u0000")
 
@@ -92,11 +94,17 @@ def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
 
 
 def classify(path: Path) -> str:
+    # region.json is the per-event slide-region input config (design §4.1):
+    # registered for provenance but never an eligible source (never moved).
+    if path.name == "region.json":
+        return "config"
     suffix = path.suffix.lower()
     if suffix in IMAGE_EXTENSIONS:
         return "image"
     if suffix in AUDIO_EXTENSIONS:
         return "audio"
+    if suffix in VIDEO_EXTENSIONS:
+        return "video"
     if suffix in NOTE_EXTENSIONS:
         return "note"
     return "other"
@@ -148,6 +156,76 @@ def audio_metadata(path: Path) -> dict[str, Any]:
     }
 
 
+def video_metadata(path: Path) -> dict[str, Any]:
+    """Probe a video file with ffprobe; never raise.
+
+    Missing ffprobe or malformed output degrades every field to None so a
+    corrupt/odd video can never crash inventory (design §3.7/§5).
+    """
+    metadata: dict[str, Any] = {
+        "duration_seconds": None,
+        "has_audio": None,
+        "width": None,
+        "height": None,
+    }
+    if not shutil.which("ffprobe"):
+        return metadata
+    code, output = run_probe(
+        [
+            "ffprobe", "-v", "quiet",
+            "-print_format", "json",
+            "-show_streams", "-show_format",
+            str(path),
+        ],
+        timeout=60,
+    )
+    if code != 0:
+        metadata["probe_error"] = output.strip()[:500]
+        return metadata
+    try:
+        payload = json.loads(output)
+    except json.JSONDecodeError:
+        metadata["probe_error"] = "ffprobe output is not valid JSON"
+        return metadata
+    streams = payload.get("streams") if isinstance(payload, dict) else None
+    format_info = payload.get("format") if isinstance(payload, dict) else None
+    if not isinstance(streams, list):
+        streams = []
+    if not isinstance(format_info, dict):
+        format_info = {}
+    metadata["has_audio"] = any(
+        isinstance(stream, dict) and stream.get("codec_type") == "audio"
+        for stream in streams
+    )
+    video_stream = next(
+        (stream for stream in streams
+         if isinstance(stream, dict) and stream.get("codec_type") == "video"),
+        None,
+    )
+    duration = format_info.get("duration")
+    if duration is None and isinstance(video_stream, dict):
+        duration = video_stream.get("duration")
+    try:
+        parsed_duration = float(duration) if duration is not None else None
+    except (TypeError, ValueError):
+        parsed_duration = None
+    # nan/inf would serialize as non-RFC JSON literals into the manifest;
+    # degrade them to null like any other malformed probe value.
+    metadata["duration_seconds"] = (
+        parsed_duration
+        if parsed_duration is not None and math.isfinite(parsed_duration)
+        else None
+    )
+    if isinstance(video_stream, dict):
+        for key in ("width", "height"):
+            try:
+                value = video_stream.get(key)
+                metadata[key] = int(value) if value is not None else None
+            except (TypeError, ValueError, OverflowError):
+                metadata[key] = None
+    return metadata
+
+
 def inventory(source: Path) -> dict[str, Any]:
     source = source.resolve()
     if not source.is_dir():
@@ -164,12 +242,14 @@ def inventory(source: Path) -> dict[str, Any]:
             "size_bytes": stat.st_size,
             "modified_at": dt.datetime.fromtimestamp(stat.st_mtime, dt.timezone.utc).astimezone().isoformat(),
             "sha256": sha256_file(path),
-            "eligible_source": kind in {"image", "audio", "note"} and not path.name.startswith("."),
+            "eligible_source": kind in {"image", "audio", "note", "video"} and not path.name.startswith("."),
         }
         if kind == "image":
             item["media"] = image_metadata(path)
         elif kind == "audio":
             item["media"] = audio_metadata(path)
+        elif kind == "video":
+            item["media"] = video_metadata(path)
         files.append(item)
     counts: dict[str, int] = {}
     for item in files:

@@ -46,9 +46,12 @@ cd meeting-summary-tool
 ```
 
 `setup.sh` is idempotent (re-run resumes), puts third-party deps under
-`vendor/` (gitignored), never overwrites an existing `config.json`, and
-only reports success after the test suite passes. Afterwards, in a **new
-terminal**:
+`vendor/` (gitignored), and never overwrites an existing `config.json`.
+The local console opens even when dependencies are absent: it shows a
+local-only checklist with each component's purpose, required/optional status,
+download estimate, and official source. Select components and explicitly
+start installation from that page; installation runs locally and can be
+retried or rechecked. Afterwards, in a **new terminal**:
 
 ```bash
 mst               # open the local web console at http://127.0.0.1:8788
@@ -87,12 +90,14 @@ Two entry points, one engine / 同一引擎，两种入口：
 | 状态 | 从磁盘推导（`input/ runs/ outputs/`），重启自愈 | 进程内 |
 | 适用 | 日常投放、盯进度、回查结果 | 脚本化、cron、无人值守 |
 
-Minimal web demo / 最小演示：`mst` → 左区拖入任意短音频（或先跑
+Minimal web demo / 最小演示：`mst` → 左区拖入任意短音频、录屏视频或笔记（或先跑
 `python3 scripts/make_demo_event.py` 生成合成事件素材再拖入）→ 「开始编译」
-→ 观察 12 站轨道推进 → 结果包区在线阅读 / 下载 zip。
+→ 观察阶段轨道推进 → 结果包区在线阅读 / 下载 zip。录屏会先提取音轨和幻灯片候选；
+自动识别的幻灯片区域须在本地页面确认。
 
-Troubleshooting / 故障排查：启动预检逐项给出 ✗ 清单（config / ffmpeg /
-whisper / Qwen venv / Ollama），逐项修复后重试；`GET /api/status` 是健康探针。
+Troubleshooting / 故障排查：启动预检逐项给出依赖清单（ffmpeg / whisper /
+Ollama 为基础项，Qwen 与录屏工具为增强项），选择后由本机装配器处理；失败会保留
+退出原因并可重试。`GET /api/status` 是健康探针。
 详见 INSTALL.md 与 PRIVACY_AND_DATA_FLOW.md。
 
 ## Environment variables / 环境变量总表
@@ -102,7 +107,8 @@ env > config.json > default：
 
 | 变量 | 必填 | 作用 |
 |---|---|---|
-| `MST_WHISPER_BIN` / `MST_WHISPER_MODEL` / `MST_QWEN_PYTHON` | 是 | ASR 引擎与 Qwen venv 绝对路径 |
+| `MST_WHISPER_BIN` / `MST_WHISPER_MODEL` | 是 | Whisper ASR 引擎绝对路径 |
+| `MST_QWEN_PYTHON` / `MST_TOOLS_PYTHON` | 否 | Qwen ASR 与录屏工具 venv 的绝对路径 |
 | `MST_OLLAMA_URL` / `MST_OLLAMA_MODEL` | 否 | 本地 LLM（默认 `http://127.0.0.1:11434` / `qwen3:8b`） |
 | `MST_FFMPEG` / `MST_WHISPER_ROOT` | 否 | ffmpeg 路径覆盖 / whisper.cpp 根目录 |
 | `MST_WEB_PORT` | 否 | 网页控制台端口（默认 8788） |
@@ -142,7 +148,7 @@ Personal paths live in `config.json`, which is gitignored.
 - `ARCHITECTURE.md` — the 9-stage pipeline, ID system, audit guard
 - `docs/PROGRESS_CONTRACT.md` — the engine↔console progress contract
 - `PRIVACY_AND_DATA_FLOW.md` — `_private` visibility across MCP/CLI/web, data flow
-- `tests/` — 81 tests, all runnable without real models (`python3 -m unittest discover tests`)
+- `tests/` — local unit and synthetic-video tests, runnable without model weights (`python3 -m unittest discover tests`)
 
 ## Known limitations / 已知限制
 
@@ -151,7 +157,11 @@ Personal paths live in `config.json`, which is gitignored.
 - The automated bootstrap (`./setup.sh`) covers a fresh macOS machine, but
   exhaustive fresh-hardware coverage is still limited; heavy steps can be
   skipped via `MST_SETUP_SKIP`.
-- Chinese quality depends on Qwen3-ASR; without it you get English-only mode
+- Qwen3-ASR improves Chinese and code-switching recognition; without it the
+  local Whisper fallback remains available but may be less accurate
+- Fragmented or mixed-meeting input is parsed independently first. The console
+  shows conservative candidate groups, reading order, and possible gaps; it
+  never invents missing speech or silently merges uncertain meetings
 - Single-event scaling tested to ~2h audio / ~900 sentence records
 - The synthetic demo proves the chain, not transcription quality
 

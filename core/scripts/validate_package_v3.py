@@ -34,9 +34,11 @@ def main() -> int:
     literal_text = (args.package_dir / "02_逐句会议记录.md").read_text(encoding="utf-8")
     slide_text = (args.package_dir / "03_PPT补充信息.md").read_text(encoding="utf-8")
     report_text = (args.package_dir / "04_会议报告.md").read_text(encoding="utf-8")
+    # Slide evidence headings are E###### (classic photo flow) or I######
+    # (screen-recording console flow, design §4.4); both satisfy the check.
     checks.update({
         "literal_ids_complete": set(re.findall(r"^### (R\d{6})", literal_text, re.MULTILINE)) == {row["record_id"] for row in literal_rows},
-        "slide_evidence_complete": {evidence_id for row in relations for evidence_id in row.get("slide_evidence_ids") or []}.issubset(set(re.findall(r"^### (E\d{6})", slide_text, re.MULTILINE))),
+        "slide_evidence_complete": {evidence_id for row in relations for evidence_id in row.get("slide_evidence_ids") or []}.issubset(set(re.findall(r"^### ([EI]\d{6})", slide_text, re.MULTILINE))),
         "literal_has_timestamps": all("start_seconds" in row and "end_seconds" in row for row in literal_rows),
         "literal_preserves_raw_and_clean": all(isinstance(row.get("raw_text"), str) and isinstance(row.get("clean_literal"), str) for row in literal_rows),
         "utf8_without_replacement_characters": "�" not in literal_text + slide_text + report_text,
@@ -56,7 +58,16 @@ def main() -> int:
     for item in manifest.get("files") or []:
         if not item.get("eligible_source", item.get("kind") in {"audio", "image", "note"}):
             continue
-        path = root / item["relative_path"]
+        # Derived media (e.g. audio extracted from a screen recording) lives in
+        # runs/, not under source_root; such manifest items carry an absolute
+        # "path" override (design §4.3) instead of relying on join quirks.
+        path = Path(item["path"]) if item.get("path") else root / item["relative_path"]
+        if item.get("path") and not path.is_absolute():
+            # A relative override would silently resolve against the CWD and
+            # hash the wrong file; fail loud instead (review 2026-09-30).
+            raise SystemExit(
+                f"manifest path override must be absolute: {item['source_id']}: {item['path']}"
+            )
         if not path.is_file() or sha256(path) != item["sha256"]:
             mismatches.append(item["source_id"])
     checks["sources_immutable"] = not mismatches
