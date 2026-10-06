@@ -40,6 +40,58 @@ warn() { printf '  ! %s\n' "$1"; }
 die()  { printf '  ✗ %s\n' "$1" >&2; exit 1; }
 has_skip() { case " $SKIP " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 
+# ---- --check：只验证不安装（干跑），必需缺失退出码 1 -------------------------
+if [ "${1:-}" = "--check" ]; then
+    missing_req=""
+    chk() { # chk <req|opt> <名称> <命令...>
+        _kind=$1; _name=$2; shift 2
+        if "$@" >/dev/null 2>&1; then
+            ok "$_name"
+        else
+            if [ "$_kind" = req ]; then
+                printf '  ✗ %s（必需，缺失）\n' "$_name"
+                missing_req="$missing_req $_name"
+            else
+                warn "$_name（可选，未就绪）"
+            fi
+        fi
+    }
+    printf '== 一键装配自检（--check 只读，不安装任何东西）\n'
+    [ "$(uname)" = "Darwin" ] || { printf '  ✗ 非 macOS\n'; exit 2; }
+    chk req "git"            command -v git
+    chk req "python3"        python3 -c 'import sys; assert sys.version_info[:2] >= (3,10) and sys.version_info[:2] <= (3,12)'
+    chk req "ffmpeg"         command -v ffmpeg
+    chk req "ollama"         command -v ollama
+    if command -v ollama >/dev/null 2>&1; then
+        chk req "ollama 服务"    curl -sf --max-time 3 http://127.0.0.1:11434/api/tags
+        ollama list 2>/dev/null | grep -q "qwen3:8b" || { printf '  ✗ 模型 qwen3:8b（必需，缺失）\n'; missing_req="$missing_req qwen3:8b"; }
+    fi
+    # whisper 路径口径与网页面板一致：config.json > vendor 默认
+    W_CK_BIN=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]+"/config.json")).get("whisper_bin",""))' "$REPO" 2>/dev/null)
+    W_CK_MODEL=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]+"/config.json")).get("whisper_model",""))' "$REPO" 2>/dev/null)
+    W_CK_BIN=${W_CK_BIN:-$W_BIN}; W_CK_MODEL=${W_CK_MODEL:-$W_MODEL}
+    [ -x "$W_CK_BIN" ] && ok "whisper-cli（$W_CK_BIN）" || { printf '  ✗ whisper-cli（必需，缺失）\n'; missing_req="$missing_req whisper"; }
+    [ -s "$W_CK_MODEL" ] && ok "whisper 模型（$W_CK_MODEL）" || { printf '  ✗ whisper 模型（必需，缺失）\n'; missing_req="$missing_req whisper-model"; }
+    if [ -x "$QVENV/bin/python" ] && "$QVENV/bin/python" -c "import torch, transformers, accelerate, qwen_asr" >/dev/null 2>&1; then
+        ok "Qwen3-ASR venv"
+    else
+        warn "Qwen3-ASR venv（可选，未就绪——中文增强转写缺它质量下降）"
+    fi
+    if [ -x "$TVENV/bin/python" ] && "$TVENV/bin/python" -c "import numpy, cv2, pypinyin" >/dev/null 2>&1; then
+        ok "tools-venv"
+    else
+        warn "tools-venv（可选，未就绪——仅录屏事件需要）"
+    fi
+    [ -f "$REPO/config.json" ] && ok "config.json" || { printf '  ✗ config.json（必需，缺失——跑一次 ./setup.sh 自动生成）\n'; missing_req="$missing_req config.json"; }
+    command -v mst >/dev/null 2>&1 && ok "启动器 mst" || warn "启动器 mst（未安装——./install.sh 可装）"
+    if [ -n "$missing_req" ]; then
+        printf '\n✗ 必需依赖缺失:%s\n  一键补齐：./setup.sh\n' "$missing_req"
+        exit 1
+    fi
+    printf '\n✓ 必需依赖全部就绪。开始使用：mst\n'
+    exit 0
+fi
+
 # ---- 0. 前置 --------------------------------------------------------------
 step "0/8 前置检查"
 [ "$(uname)" = "Darwin" ] || die "本装配器面向 macOS（当前: $(uname)）"

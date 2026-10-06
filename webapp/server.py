@@ -66,7 +66,7 @@ DEPENDENCY_PLAN = INPUT_DIR / ".meeting-plan.json"
 FRAGMENT_PLAN = RUNS_DIR / ".fragment-reading-order.json"
 
 _supervision: dict = {"proc": None, "thread": None, "stop_requested": False,
-                      "auto_restarts": 0}
+                      "auto_restarts": 0, "generation": 0}
 _install: dict = {"proc": None, "ids": [], "started": None, "error": ""}
 
 
@@ -110,8 +110,87 @@ def default_event_name() -> str:
     return time.strftime("web-%Y%m%d-%H%M%S")
 
 
-def dependency_status() -> dict:
-    """A non-mutating local inventory.  It never uploads data or starts apps."""
+def governor_snapshot() -> dict | None:
+    """Live resource-governor state for the console (best-effort, optional)."""
+    try:
+        import resource_governor
+        return resource_governor.get_governor().snapshot()
+    except Exception:
+        return None
+
+
+def dependency_status(force: bool = False) -> dict:
+    """A non-mutating local inventory.  It never uploads data or starts apps.
+
+    Probes (torch import, HF cache scan) cost seconds of CPU, so results are
+    cached briefly; every /api/status poll used to cold-start a python child
+    on weak machines.  Install start/finish invalidates the cache."""
+    now = time.time()
+    if not force and _dep_cache["payload"] is not None \
+            and now - _dep_cache["ts"] < DEP_CACHE_TTL_S \
+            and not _dep_cache["dirty"]:
+        payload = dict(_dep_cache["payload"])
+    else:
+        payload = _dependency_status_uncached()
+        _dep_cache.update({"payload": payload, "ts": now, "dirty": False})
+    proc = _install.get("proc")
+    running = bool(proc is not None and proc.poll() is None)
+    if proc is not None and not running and proc.returncode:
+        _install["error"] = f"安装进程退出码 {proc.returncode}；可重试或查看本地日志。"
+        _dep_cache["dirty"] = True   # install finished → reprobe next poll
+    if proc is not None and running:
+        _dep_cache["dirty"] = True   # installing → keep probing until settled
+    return {**payload, "installing": running, "installing_ids": _install["ids"],
+            "error": _install["error"], "local_only": True}
+
+
+DEP_CACHE_TTL_S = 20.0
+_dep_cache = {"ts": 0.0, "payload": None, "dirty": False}
+_dep_probe_lock = __import__("threading").Lock()
+_dep_probe_started = False
+
+
+def dependency_summary_cached() -> dict:
+    """Cache-only view for /api/status: NEVER blocks on probes.
+
+    Cold start (first poll after boot) kicks ONE background probe thread and
+    returns a probing placeholder — /api/status is polled every second and
+    must stay fast on weak machines; real probing stays on /api/dependencies
+    where the caller (browser fetch) tolerates seconds."""
+    global _dep_probe_started
+    if _dep_cache["payload"] is None:
+        with _dep_probe_lock:
+            if not _dep_probe_started:
+                _dep_probe_started = True
+                import threading
+                threading.Thread(target=_background_dep_probe, daemon=True).start()
+        proc = _install.get("proc")
+        running = bool(proc is not None and proc.poll() is None)
+        return {"probing": True, "items": [], "local_only": True,
+                "installing": running, "installing_ids": _install["ids"],
+                "error": _install["error"]}
+    payload = dict(_dep_cache["payload"])
+    proc = _install.get("proc")
+    running = bool(proc is not None and proc.poll() is None)
+    if proc is not None and not running and proc.returncode:
+        _install["error"] = f"安装进程退出码 {proc.returncode}；可重试或查看本地日志。"
+        _dep_cache["dirty"] = True
+    return {**payload, "installing": running, "installing_ids": _install["ids"],
+            "error": _install["error"], "local_only": True}
+
+
+def _background_dep_probe() -> None:
+    try:
+        payload = _dependency_status_uncached()
+        with _dep_probe_lock:
+            _dep_cache.update({"payload": payload, "ts": time.time(), "dirty": False})
+    except Exception:
+        global _dep_probe_started
+        with _dep_probe_lock:
+            _dep_probe_started = False  # allow a retry on the next cold read
+
+
+def _dependency_status_uncached() -> dict:
     vendor = ROOT / "vendor"
     try:
         if str(ROOT) not in sys.path:
@@ -152,24 +231,30 @@ def dependency_status() -> dict:
         "tools": (vendor / "tools-venv" / "bin" / "python").is_file(),
     }
     meta = {
-        "ffmpeg": ("音频与录屏解码", True, "https://ffmpeg.org/download.html"),
-        "ollama": ("本机报告整理模型", True, "https://ollama.com/download"),
-        "whisper": ("本机 Whisper 转写", True, "https://github.com/ggerganov/whisper.cpp"),
-        "qwen": ("中文或中英混合语音增强转写（Qwen3-ASR-1.7B）", False, "https://github.com/QwenLM/Qwen3-ASR"),
-        "tools": ("录屏幻灯片与 OCR 工具", False, "https://opencv.org/"),
+        "ffmpeg": ("音频与录屏解码", True, "https://ffmpeg.org/download.html",
+                   "开源音视频工具。本机用它解码你导入的录音/录屏、抽取音轨并做降噪预处理。",
+                   "没有它无法解析任何音频或视频输入，编译完全无法进行。"),
+        "ollama": ("本机报告整理模型", True, "https://ollama.com/download",
+                   "本地大模型运行器，承载 qwen3:8b，负责主题提取、报告整理与质量审计，全程不出本机。",
+                   "没有它无法生成会议报告与主题索引；开始编译也会被依赖门拦下。"),
+        "whisper": ("本机 Whisper 转写", True, "https://github.com/ggerganov/whisper.cpp",
+                   "whisper.cpp 引擎 + large-v3-turbo 量化模型（约 575MB），英文转写主力，并参与中文交叉验证。",
+                   "没有它无法转写任何语音，编译无法进行。"),
+        "qwen": ("中文/中英混合增强转写", False, "https://github.com/QwenLM/Qwen3-ASR",
+                 "阿里 Qwen3-ASR 本地模型（数 GB）。中文与中英混合音频的主力转写引擎，与 whisper 逐轨交叉仲裁；纯英文会议用不到它。",
+                 "缺失时中文会议转写质量明显下降（仅剩 whisper，中文易幻听）；纯英文会议不受影响。"),
+        "tools": ("录屏幻灯片与 OCR 工具", False, "https://opencv.org/",
+                  "numpy/opencv/pypinyin 工具环境（tools-venv）。仅在处理会议录屏视频时用于幻灯片区域检测与 OCR 修正建议。",
+                  "不处理录屏视频则完全用不到；处理录屏时幻灯片轨跳过（音轨照常转写）。"),
     }
     sizes = {"ffmpeg": "基础工具", "ollama": "本机模型约 5 GB", "whisper": "模型约 575 MB",
              "qwen": "增强模型为数 GB", "tools": "仅录屏额外工具"}
     items = [{"id": key, "ready": checks[key], "purpose": meta[key][0],
               "required": meta[key][1], "tier": "基础" if meta[key][1] else "增强",
-              "download": sizes[key], "official_url": meta[key][2]}
+              "download": sizes[key], "official_url": meta[key][2],
+              "detail": meta[key][3], "consequence": meta[key][4]}
              for key in DEPENDENCY_IDS]
-    proc = _install.get("proc")
-    running = bool(proc is not None and proc.poll() is None)
-    if proc is not None and not running and proc.returncode:
-        _install["error"] = f"安装进程退出码 {proc.returncode}；可重试或查看本地日志。"
-    return {"items": items, "installing": running, "installing_ids": _install["ids"],
-            "error": _install["error"], "local_only": True}
+    return {"items": items, "local_only": True}
 
 
 def install_dependencies(ids) -> tuple[int, dict]:
@@ -194,6 +279,102 @@ def install_dependencies(ids) -> tuple[int, dict]:
     return 202, {"ok": True, "message": "本地安装已开始", "ids": wanted}
 
 
+def install_log() -> dict:
+    """Tail of the local setup log for the install progress view."""
+    log = WEBAPP_STATE_DIR / "dependency-install.log"
+    tail = ""
+    if log.is_file():
+        try:
+            with open(log, "rb") as fh:
+                fh.seek(0, os.SEEK_END)
+                size = fh.tell()
+                fh.seek(max(0, size - 8000))
+                tail = fh.read().decode("utf-8", errors="replace")
+        except OSError:
+            tail = ""
+    proc = _install.get("proc")
+    running = bool(proc is not None and proc.poll() is None)
+    return {"installing": running, "ids": _install.get("ids", []),
+            "error": _install.get("error", ""), "tail": tail}
+
+
+# ---- fragment assembly v2 (plan build / confirm; review UI = assembly.html)
+
+_assembly = {"proc": None, "started": 0.0, "error": ""}
+
+
+def assembly_plan() -> dict:
+    """V2 assembly plan plus local build/confirm state. The plan file is
+    always a regenerable artifact; confirmation lives in its own sidecar."""
+    plan = _read_json(RUNS_DIR / ".assembly-plan.json")
+    has_fragments = RUNS_DIR.exists() and any(
+        p.is_dir() and p.name.startswith("fragment-") for p in RUNS_DIR.iterdir())
+    fragment_count = sum(
+        1 for p in RUNS_DIR.iterdir()
+        if p.is_dir() and p.name.startswith("fragment-")) if RUNS_DIR.exists() else 0
+    if not plan or plan.get("kind") != "fragment_assembly_plan":
+        proc = _assembly.get("proc")
+        building = bool(proc is not None and proc.poll() is None)
+        return {"status": "absent", "building": building,
+                "has_fragments": has_fragments, "fragment_count": fragment_count,
+                "error": _assembly.get("error", ""),
+                "notice": "尚未生成装配计划。上传散乱片段并完成编译后，点「生成装配计划」。"}
+    confirm = _read_json(RUNS_DIR / ".assembly-confirm.json") or {}
+    ids = [fid for g in plan.get("groups", []) for fid in g.get("fragment_ids", [])]
+    proc = _assembly.get("proc")
+    building = bool(proc is not None and proc.poll() is None)
+    if proc is not None and not building and proc.returncode:
+        _assembly["error"] = f"装配分析退出码 {proc.returncode}；可重试。"
+    out = dict(plan)
+    out["confirmed"] = bool(ids) and confirm.get("fragment_ids") == ids
+    out["building"] = building
+    out["error"] = _assembly.get("error", "")
+    out["has_fragments"] = has_fragments
+    out["fragment_count"] = fragment_count
+    return out
+
+
+def build_assembly() -> tuple[int, dict]:
+    """Run the v2 assembly analyzer as a detached local subprocess (LLM
+    inside degrades itself when Ollama is absent). One at a time."""
+    proc = _assembly.get("proc")
+    if proc is not None and proc.poll() is None:
+        return 409, {"error": "装配分析已在进行中"}
+    has_fragments = RUNS_DIR.exists() and any(
+        p.is_dir() and p.name.startswith("fragment-") for p in RUNS_DIR.iterdir())
+    if not has_fragments:
+        return 409, {"error": "当前没有碎片事件（fragment-*）。请先在投放面板勾选「散乱多会议片段」上传并完成编译。"}
+    WEBAPP_STATE_DIR.mkdir(parents=True, exist_ok=True)
+    log = WEBAPP_STATE_DIR / "assembly-build.log"
+    cmd = [sys.executable, "-B", str(ROOT / "core" / "scripts" / "fragment_assembly.py"),
+           "--runs-dir", str(RUNS_DIR), "--output", str(RUNS_DIR / ".assembly-plan.json")]
+    model = os.environ.get("MST_OLLAMA_MODEL")
+    if model:
+        cmd += ["--ollama-model", model]
+    with open(log, "ab") as out:
+        proc = subprocess.Popen(cmd,
+            cwd=ROOT, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
+            start_new_session=True)
+    _assembly.update({"proc": proc, "started": time.time(), "error": ""})
+    return 202, {"ok": True, "message": "装配分析已开始，完成后此处会出现候选分组"}
+
+
+def confirm_assembly(fragment_ids, junction_marks=None) -> tuple[int, dict]:
+    """Persist the user-reviewed reading order (and junction marks) as a
+    sidecar next to the plan. Marks: junction key -> "ok" | "gap"."""
+    plan = _read_json(RUNS_DIR / ".assembly-plan.json")
+    if not plan or plan.get("kind") != "fragment_assembly_plan":
+        return 409, {"error": "尚未生成装配计划，无法确认"}
+    actual = [fid for g in plan.get("groups", []) for fid in g.get("fragment_ids", [])]
+    if sorted(fragment_ids or []) != sorted(actual):
+        return 400, {"error": "确认列表与当前装配计划不一致，请刷新后重试"}
+    marks = junction_marks if isinstance(junction_marks, dict) else {}
+    _atomic_write_json(RUNS_DIR / ".assembly-confirm.json",
+                       {"fragment_ids": actual, "junction_marks": marks,
+                        "confirmed_ts": time.time()})
+    return 200, {"ok": True, "fragment_ids": actual}
+
+
 def candidate_plan() -> dict:
     """Build a plan only from already-local parse receipts, metadata and notes.
     Raw file mtimes are deliberately not treated as a meeting order."""
@@ -201,11 +382,16 @@ def candidate_plan() -> dict:
     # Completed runs survive normal input cleanup.  They are the authoritative
     # source for a post-parse plan; queued input is included only when a run
     # still exists for it, never as raw-mtime ordering evidence.
-    queued = {q["name"]: q for q in scan_queue()}
+    queued = {q["name"]: q for q in scan_queue()
+              if not q["name"].startswith("fragment-")}
     parsed_names = []
     if RUNS_DIR.exists():
         for run in RUNS_DIR.iterdir():
+            # Fragment events belong to the assembly workbench (v2), not the
+            # whole-meeting candidate list; mixing them forced fake multi-
+            # meeting confirmation gates on ordinary users.
             if (run.is_dir() and not run.name.startswith(".")
+                    and not run.name.startswith("fragment-")
                     and (run / "manifest.json").is_file()
                     and (run / "literal_records.jsonl").is_file()
                     and (run / "literal_records.jsonl").stat().st_size > 0):
@@ -934,9 +1120,11 @@ def aggregate_status() -> dict:
                    "audio_hours": round(audio_seconds / 3600, 2)},
         "recent": rows[-30:],
         "outputs": outputs,
-        "dependencies": dependency_status(),
+        "dependencies": dependency_summary_cached(),
         "candidate_plan": candidate_plan(),
         "fragment_plan": fragment_reading_plan(),
+        "assembly": assembly_plan(),
+        "governor": governor_snapshot(),
     }
 
 
@@ -963,14 +1151,20 @@ def _spawn_pipeline() -> int:
     PID_FILE.write_text(json.dumps({"pid": proc.pid, "started": time.time()}),
                         encoding="utf-8")
     _supervision["proc"] = proc
-    watcher = threading.Thread(target=_watch_pipeline, args=(proc,), daemon=True)
+    watcher = threading.Thread(target=_watch_pipeline, args=(proc, _supervision["generation"]),
+                               daemon=True)
     watcher.start()
     _supervision["thread"] = watcher
     return proc.pid
 
 
-def _watch_pipeline(proc: subprocess.Popen) -> None:
+def _watch_pipeline(proc: subprocess.Popen, generation: int) -> None:
     rc = proc.wait()
+    if generation != _supervision["generation"]:
+        # Stale watcher from a previous supervision cycle (tests swap workspaces;
+        # long-lived servers can transition too). Touching pidfile/respawn here
+        # would corrupt the NEW cycle's state — abandon without side effects.
+        return
     PID_FILE.unlink(missing_ok=True)
     _supervision["proc"] = None
     if _supervision["stop_requested"]:
@@ -981,8 +1175,9 @@ def _watch_pipeline(proc: subprocess.Popen) -> None:
     if rc == 0 and scan_queue() and _supervision["auto_restarts"] < MAX_AUTO_RESTARTS:
         _supervision["auto_restarts"] += 1
         time.sleep(2)
-        if not _supervision["stop_requested"]:
-            _spawn_pipeline()
+        if _supervision["stop_requested"] or generation != _supervision["generation"]:
+            return
+        _spawn_pipeline()
     else:
         _supervision["auto_restarts"] = 0
 
@@ -1000,6 +1195,7 @@ def start_pipeline() -> tuple[int, str]:
         return 409, (REGION_GATE_MSG + "、".join(awaiting)
                      + "。请先在队列卡片点击「确认幻灯片区域」，再启动编译")
     _supervision["stop_requested"] = False
+    _supervision["generation"] += 1
     pid = _spawn_pipeline()
     return 202, f"pipeline started (pid {pid})"
 
@@ -1009,6 +1205,7 @@ def stop_pipeline() -> tuple[int, str]:
     if pid is None and _supervision["proc"] is None:
         return 409, "no pipeline running"
     _supervision["stop_requested"] = True
+    _supervision["generation"] += 1
     proc = _supervision["proc"]
     if proc is not None:
         try:
@@ -1023,6 +1220,9 @@ def stop_pipeline() -> tuple[int, str]:
             except (OSError, ProcessLookupError):
                 pass
             proc.wait(timeout=5)
+    # 停止方拥有本监督周期：stale watcher 因 generation 失配不再做清理，
+    # proc 置空必须由这里完成，否则后续 start 会永远 409。
+    _supervision["proc"] = None
     PID_FILE.unlink(missing_ok=True)
     # Stamp ONLY a genuinely in-flight event, decided on the RAW disk snapshot:
     # the pidfile is already gone, so current_event_state()'s reconciliation
@@ -1195,7 +1395,17 @@ CONTENT_TYPES = {".html": "text/html; charset=utf-8",
                  ".svg": "image/svg+xml", ".png": "image/png",
                  ".md": "text/markdown; charset=utf-8",
                  ".json": "application/json; charset=utf-8",
-                 ".db": "application/octet-stream"}
+                 ".db": "application/octet-stream",
+                 ".m4a": "audio/mp4", ".mp3": "audio/mpeg", ".wav": "audio/wav",
+                 ".aac": "audio/aac", ".flac": "audio/flac",
+                 ".aiff": "audio/aiff", ".caf": "audio/x-caf",
+                 ".mp4": "video/mp4", ".mov": "video/quicktime",
+                 ".mkv": "video/x-matroska", ".webm": "video/webm",
+                 ".m4v": "video/x-m4v"}
+
+# Range streaming window for open-ended requests: bounded chunks keep the
+# 16GB-Mac iron rule honest (never buffer a whole multi-GB recording).
+AUDIO_STREAM_WINDOW = 524288
 
 
 class ConsoleHandler(BaseHTTPRequestHandler):
@@ -1229,17 +1439,24 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         if url.path == "/api/status":
             return self._json(200, aggregate_status())
         if url.path == "/api/dependencies":
-            return self._json(200, dependency_status())
+            qs = parse_qs(url.query)
+            return self._json(200, dependency_status(force="refresh" in qs))
+        if url.path == "/api/dependencies/install-log":
+            return self._json(200, install_log())
         if url.path == "/api/candidates":
             return self._json(200, candidate_plan())
         if url.path == "/api/fragments":
             return self._json(200, fragment_reading_plan())
+        if url.path == "/api/assembly":
+            return self._json(200, assembly_plan())
         if url.path == "/api/outputs":
             return self._json(200, {"outputs": aggregate_status()["outputs"]})
         if url.path.startswith("/api/outputs/"):
             return self._outputs_route(url)
         if url.path.startswith("/api/events/"):
             return self._events_route(url)
+        if url.path.startswith("/api/audio/"):
+            return self._audio_route(url)
         if url.path == "/api/logs":
             return self._logs_route(parse_qs(url.query))
         self._json(404, {"error": "not found"})
@@ -1275,6 +1492,61 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         if parts[1] == "zip":
             return self._zip(base, event)
         self._json(404, {"error": "not found"})
+
+    def _audio_route(self, url) -> None:
+        """/api/audio/<event>/<file> — bounded Range streaming out of
+        runs/<event>/source/ for junction audition. Read-only; chunks stay
+        small so a whole recording is never buffered in memory."""
+        parts = [p for p in url.path.split("/") if p][2:]
+        if len(parts) != 2:
+            return self._json(404, {"error": "event and file required"})
+        event, fname = unquote(parts[0]), unquote(parts[1])
+        path = safe_join(RUNS_DIR / event / "source", fname)
+        if path is None or not path.is_file():
+            return self._json(404, {"error": "audio not found"})
+        total = path.stat().st_size
+        if total <= 0:
+            return self._json(404, {"error": "audio file is empty"})
+        rng = self.headers.get("Range", "").strip()
+        m = re.match(r"^bytes=(\d*)-(\d*)$", rng)
+        start, end, ranged = 0, min(total - 1, AUDIO_STREAM_WINDOW - 1), False
+        if rng:
+            if not m:
+                self.send_response(416)
+                self.send_header("Content-Range", f"bytes */{total}")
+                self.end_headers()
+                return
+            ranged = True
+            s, e = m.group(1), m.group(2)
+            if s == "":
+                n = int(e) if e else 0
+                if n <= 0 or n > total:
+                    self.send_response(416)
+                    self.send_header("Content-Range", f"bytes */{total}")
+                    self.end_headers()
+                    return
+                start, end = max(0, total - n), total - 1
+            else:
+                start = int(s)
+                if start >= total:
+                    self.send_response(416)
+                    self.send_header("Content-Range", f"bytes */{total}")
+                    self.end_headers()
+                    return
+                end = int(e) if e else min(total - 1, start + AUDIO_STREAM_WINDOW - 1)
+        end = min(end, total - 1)
+        length = end - start + 1
+        with open(path, "rb") as fh:
+            fh.seek(start)
+            body = fh.read(length)
+        self.send_response(206 if ranged else 200)
+        self.send_header("Content-Type", CONTENT_TYPES.get(path.suffix, "application/octet-stream"))
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Accept-Ranges", "bytes")
+        if ranged:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{total}")
+        self.end_headers()
+        self.wfile.write(body)
 
     def _events_route(self, url) -> None:
         """/api/events/<event>/region_preview.png — statically serve the
@@ -1348,6 +1620,16 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             return self._json(code, payload)
         if url.path == "/api/fragments/confirm":
             code, payload = confirm_fragment_reading_order()
+            return self._json(code, payload)
+        if url.path == "/api/assembly/build":
+            code, payload = build_assembly()
+            return self._json(code, payload)
+        if url.path == "/api/assembly/confirm":
+            body = self._json_body(length)
+            if body is None or not isinstance(body.get("fragment_ids"), list):
+                return self._json(400, {"error": "请求体需要 fragment_ids 数组"})
+            code, payload = confirm_assembly(body["fragment_ids"],
+                                             body.get("junction_marks"))
             return self._json(code, payload)
         if url.path == "/api/start":
             # MST_PIPELINE_CMD is an internal test hook.  Real console starts

@@ -1,0 +1,61 @@
+/* 碎片装配工作台 —— 复用 style.css 设计系统（米白纸面/靛蓝墨/发丝线） */
+
+.asm-link { text-decoration: none; padding: 6px 12px; }
+
+.asm-group { border: 1px solid var(--line); border-radius: 6px; margin-bottom: 14px; }
+.asm-group-head {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 8px 12px; border-bottom: 1px solid var(--line); background: #FFFFFF;
+  border-radius: 6px 6px 0 0;
+}
+.asm-group-title { font-weight: 600; }
+.asm-conf { font-size: 11px; padding: 1px 8px; border-radius: 999px; border: 1px solid var(--line); }
+.asm-conf-high { color: var(--accent); border-color: var(--accent); }
+.asm-conf-medium { color: var(--warn); border-color: var(--warn); }
+.asm-conf-low { color: var(--fail); border-color: var(--fail); }
+.asm-group-note { font-size: 12px; color: var(--ink-dim); }
+.asm-cycle { font-size: 12px; color: var(--fail); }
+
+.asm-frag {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 10px 12px; border-bottom: 1px solid var(--line);
+}
+.asm-frag:last-of-type { border-bottom: none; }
+.asm-frag-name { font-weight: 600; }
+.asm-frag-dur { font-size: 12px; color: var(--ink-faint); }
+.asm-frag-hint { font-size: 12px; color: var(--ink-dim); }
+.asm-moves { margin-left: auto; display: flex; gap: 6px; }
+.asm-move {
+  border: 1px solid var(--line); background: #FFFFFF; border-radius: 4px;
+  min-width: 30px; padding: 3px 8px; cursor: pointer; color: var(--ink);
+}
+.asm-move:hover:not(:disabled) { border-color: var(--ink-dim); }
+.asm-move:disabled { opacity: .35; cursor: default; }
+
+.asm-junction {
+  padding: 10px 12px 10px 28px; background: #F6F6F2;
+  border-bottom: 1px solid var(--line); border-left: 4px solid var(--line);
+}
+.asm-junction.gap { border-left-color: var(--fail); background: #FDF3F2; }
+.asm-junction.accepted { border-left-color: var(--accent); background: #F2F7F5; }
+.asm-junction-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.asm-junction-label { font-size: 13px; font-weight: 600; }
+.asm-junction-gapflag { color: var(--fail); font-size: 12px; font-weight: 600; }
+.asm-junction-manual { color: var(--warn); font-size: 12px; }
+.asm-summaries { font-size: 12px; color: var(--ink-dim); margin: 6px 0 0; }
+.asm-summaries .q { font-style: normal; }
+.asm-junction-actions { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+.asm-jmark {
+  border: 1px solid var(--line); background: #FFFFFF; border-radius: 4px;
+  padding: 4px 12px; cursor: pointer; font-size: 12px; color: var(--ink);
+}
+.asm-jmark:hover:not(:disabled) { border-color: var(--ink-dim); }
+.asm-jmark.on-ok { background: var(--accent); border-color: var(--accent); color: #fff; }
+.asm-jmark.on-gap { background: var(--fail); border-color: var(--fail); color: #fff; }
+.asm-jmark:disabled { opacity: .6; cursor: default; }
+.asm-listen.active { border-color: var(--accent); color: var(--accent); }
+
+.asm-skipped { font-size: 12px; color: var(--ink-dim); }
+.asm-degraded { font-size: 12px; color: var(--warn); margin-top: 4px; }
+.asm-split { font-size: 11px; padding: 2px 8px; color: var(--ink-dim); }
+.asm-split:hover { color: var(--accent, #b00); border-color: currentColor; }

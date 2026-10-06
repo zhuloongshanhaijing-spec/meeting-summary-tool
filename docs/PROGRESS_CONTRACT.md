@@ -6,25 +6,27 @@
 
 ## 1. 阶段顺序（STAGE_ORDER）
 
-`run_meeting.STAGE_ORDER` 是唯一的阶段真源（12 站，键为稳定契约）：
+`run_meeting.STAGE_ORDER` 是唯一的阶段真源（14 站，键为稳定契约）：
 
 | # | key | 中文标签 |
 |---|---|---|
 | 1 | `inventory` | 文件清单 |
-| 2 | `audio_prepare` | 音频预处理（降噪） |
-| 3 | `lang_probe` | 语言探测 |
-| 4 | `asr` | 语音识别 |
-| 5 | `literal` | 组装逐句记录 |
-| 6 | `evidence` | 生成证据 |
-| 7 | `relevance` | 无关话语过滤 |
-| 8 | `reconcile` | 主题提取与索引 |
-| 9 | `audit` | claim 保真审计 |
-| 10 | `notes` | 笔记佐证 |
-| 11 | `package` | 构建报告包 |
-| 12 | `validate` | 验证与质量门禁 |
+| 2 | `video_ingest` | 视频分解（音轨 / 幻灯片） |
+| 3 | `audio_prepare` | 音频预处理（降噪） |
+| 4 | `lang_probe` | 语言探测 |
+| 5 | `asr` | 语音识别 |
+| 6 | `literal` | 组装逐句记录 |
+| 7 | `evidence` | 生成证据 |
+| 8 | `relevance` | 无关话语过滤 |
+| 9 | `slide_align` | 幻灯片对齐 |
+| 10 | `reconcile` | 主题提取与索引 |
+| 11 | `audit` | claim 保真审计 |
+| 12 | `notes` | 笔记佐证 |
+| 13 | `package` | 构建报告包 |
+| 14 | `validate` | 验证与质量门禁 |
 
 **子阶段**：`asr` 阶段期间可发出 `asr.whisper` / `asr.segment` / `asr.qwen`，
-映射规则：取第一个 `.` 前的基名 → 父阶段索引（即都显示为第 4 站）。
+映射规则：取第一个 `.` 前的基名 → 父阶段索引（即都显示为第 5 站）。
 
 ## 2. 事件产生机制（emit_progress）
 
@@ -36,7 +38,7 @@
 - **kind 取值**：`event_start` / `stage` / `event_done` / `event_failed`
   （服务端停止时另发 `event_stopped`）
 - **status 取值**：`running` / `done` / `failed` / `stopped`
-- 快照含 `stage_index`（1–12，按上表）/ `stage_total`=12 / `stage_started`
+- 快照含 `stage_index`（1–14，按上表）/ `stage_total`=14 / `stage_started`
   （该阶段开始时刻，供前端计算已耗时）/ `updated`
 
 ## 3. 机器可读的最终结果
@@ -70,3 +72,19 @@
 `tests/test_progress_hook.py`（8 例）钉住：快照 schema、子阶段→父索引映射、
 阶段切换时间戳、`event_done/event_failed` 终态、输出目录覆盖与非法回退、
 进度故障不影响引擎。`webapp` 侧消费由 `tests/test_webapp_server.py` 覆盖。
+
+## 7. 网页界面消费（v0.3.0 起）
+
+编辑器（`webapp/static/app.js`）以**五个可跳转视图**消费本契约，页面本身不整页滚动：
+
+| 视图 | 哈希 | 消费的契约数据 |
+|---|---|---|
+| 投放 | `#drop` | 队列、依赖门；开始编译前若队列有遗留事件先弹确认 |
+| 进度 | `#track` | `stage_index`/`stage_total`/`stage_started` 渲染阶段轨道与已耗时；`runs/progress.jsonl` 时间线 |
+| 装配 | `#assembly` | `.assembly-plan.json` 状态（`absent`/`draft`/`confirmed`）与候选分组 |
+| 结果 | `#results` | `outputs/<事件>/` 报告包 |
+| 环境 | `#env` | 依赖自检与安装 |
+
+**运行状态语义**：`.progress.json` 的 `status` ∈ `running`/`done`/`failed`/`stopped`
+是唯一的终态真源；网页不维护权威状态，重启时按磁盘对账（残留 pid 死亡 → 标"已停止"）。
+碎片装配的判读顺序对用户不可见，但保证同一批碎片无论上传先后都得到相同分组与顺序。

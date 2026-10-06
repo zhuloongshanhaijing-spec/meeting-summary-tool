@@ -589,13 +589,13 @@ class PickFolderRouteTest(unittest.TestCase):
     def test_success_strips_trailing_slash(self):
         base = self._server()
         fake = mock.Mock(returncode=0,
-                         stdout="/Users/example/会议存档/\n", stderr="")
+                         stdout="/tmp/会议存档/\n", stderr="")
         with mock.patch.object(webapp.platform, "system",
                                return_value="Darwin"), \
              mock.patch.object(webapp.subprocess, "run", return_value=fake) as run:
             code, data = self._post(base)
         self.assertEqual(code, 200)
-        self.assertEqual(data, {"path": "/Users/example/会议存档"})
+        self.assertEqual(data, {"path": "/tmp/会议存档"})
         self.assertEqual(run.call_args[0][0][0], "osascript")
 
     def test_user_cancel_is_not_an_error(self):
@@ -1367,3 +1367,75 @@ class RegionDetectRealVideoTest(unittest.TestCase):
                              {"x": 0.0, "y": 0.05, "w": 1.0, "h": 0.85})
             self.assertEqual(region["video"], "meeting.mp4")
             self.assertFalse(webapp.scan_queue()[0]["awaiting_region"])
+
+
+class AudioRouteTest(unittest.TestCase):
+    """Bounded Range streaming out of runs/<event>/source/ for audition."""
+
+    def _put_audio(self, pw, event="evA", name="clip.m4a", size=2048):
+        src = pw.root / "runs" / event / "source"
+        src.mkdir(parents=True, exist_ok=True)
+        payload = bytes(range(256)) * (size // 256)
+        (src / name).write_bytes(payload)
+        return payload
+
+    def _get_range(self, base, path, rng):
+        req = urllib.request.Request(base + path, headers={"Range": rng})
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                return (resp.status, dict(resp.headers), resp.read())
+        except urllib.error.HTTPError as exc:
+            return exc.code, dict(exc.headers), exc.read()
+
+    def test_404_then_200_with_bounded_default_window(self):
+        with PatchedWorkspace() as pw:
+            base = serve_console(self)
+            url = "/api/audio/evA/clip.m4a"
+            code, _h, _b = get_url(base, url)
+            self.assertEqual(code, 404)
+            payload = self._put_audio(pw)
+            code, ctype, body = get_url(base, url)
+            self.assertEqual(code, 200)
+            self.assertEqual(ctype, "audio/mp4")
+            self.assertEqual(body, payload[:min(len(payload), 524288)])
+            code, headers, _b = self._get_range(base, url, "bytes=0-0")
+            self.assertEqual(headers.get("Accept-Ranges"), "bytes")
+
+    def test_range_requests_return_206_slices(self):
+        with PatchedWorkspace() as pw:
+            self._put_audio(pw)
+            base = serve_console(self)
+            url = "/api/audio/evA/clip.m4a"
+            code, headers, body = self._get_range(base, url, "bytes=10-19")
+            self.assertEqual(code, 206)
+            self.assertEqual(headers.get("Content-Range"), "bytes 10-19/2048")
+            self.assertEqual(len(body), 10)
+            code, headers, body = self._get_range(base, url, "bytes=2000-")
+            self.assertEqual(code, 206)
+            self.assertEqual(headers.get("Content-Range"), "bytes 2000-2047/2048")
+            self.assertEqual(len(body), 48)
+            code, headers, body = self._get_range(base, url, "bytes=-100")
+            self.assertEqual(code, 206)
+            self.assertEqual(headers.get("Content-Range"), "bytes 1948-2047/2048")
+            self.assertEqual(len(body), 100)
+
+    def test_invalid_and_overflow_ranges_416(self):
+        with PatchedWorkspace() as pw:
+            self._put_audio(pw)
+            base = serve_console(self)
+            url = "/api/audio/evA/clip.m4a"
+            for rng in ("bytes=99999-", "bytes=-0", "bytes=zz-yy"):
+                code, headers, _b = self._get_range(base, url, rng)
+                self.assertEqual(code, 416, rng)
+                self.assertEqual(headers.get("Content-Range"), "bytes */2048", rng)
+
+    def test_traversal_and_foreign_event_404(self):
+        with PatchedWorkspace() as pw:
+            self._put_audio(pw, event="evA")
+            base = serve_console(self)
+            for path in ("/api/audio/evA/../../config.json",
+                         "/api/audio/evB/clip.m4a",
+                         "/api/audio/evA",
+                         "/api/audio/"):
+                code, _h, _b = get_url(base, quote(path, safe="/%"))
+                self.assertEqual(code, 404, path)

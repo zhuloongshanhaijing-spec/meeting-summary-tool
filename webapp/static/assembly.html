@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
+<title>碎片装配工作台 · 会议知识编译台</title>
+<link rel="stylesheet" href="/static/style.css">
+<link rel="stylesheet" href="/static/assembly.css">
+</head>
+<body>
+
+<main class="wrap">
+
+  <header class="masthead">
+    <h1>碎片装配工作台</h1>
+    <div class="mast-right">
+      <a class="btn btn-ghost asm-link" href="/">← 返回编译台</a>
+      <button id="a-rebuild" class="btn btn-ghost" type="button">重新生成计划</button>
+      <span id="a-state" class="badge badge-idle" role="status">
+        <span id="a-state-text">读取中…</span>
+      </span>
+    </div>
+  </header>
+
+  <div id="a-banner" class="deps-banner" role="status" hidden>
+    <span class="deps-banner-icon" aria-hidden="true">⚠</span>
+    <strong id="a-banner-title">提示</strong>
+    <span id="a-banner-text"></span>
+  </div>
+
+  <section class="panel" aria-labelledby="a-h-plan">
+    <h2 id="a-h-plan">装配计划（本地候选，等你审核）</h2>
+    <p id="a-notice" class="dim"></p>
+    <p id="a-meta" class="dim num"></p>
+  </section>
+
+  <section class="panel" aria-labelledby="a-h-review">
+    <h2 id="a-h-review">审核衔接与顺序</h2>
+    <p class="dim">每两个相邻片段之间都标出了分界。点「试听衔接」会按顺序播放
+    前段结尾 8 秒与后段开头 8 秒；听起来连贯就点「接受」，中间缺了内容就点「标记缺口」，
+    顺序不对用箭头调整。逐句原文不会被改动，本页只生成阅读顺序。</p>
+    <div id="a-groups"></div>
+    <div class="controls">
+      <button id="a-confirm" class="btn btn-primary" type="button">确认装配顺序</button>
+      <span id="a-confirm-msg" class="dim"></span>
+    </div>
+  </section>
+
+  <footer class="foot">装配为候选视图 · 逐句原文未改写 · 缺口如实保留</footer>
+
+</main>
+
+<div id="a-toasts" class="toasts" aria-live="polite"></div>
+
+<script src="/static/assembly.js"></script>
+</body>
+</html>

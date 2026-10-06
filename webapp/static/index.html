@@ -9,15 +9,20 @@
 </head>
 <body>
 
+<a class="skip-link" href="#main">跳到主内容</a>
+
 <div id="offline" class="offline" role="status" hidden>连接已断开，正在重试…</div>
 <div id="quit-hint" class="quit-hint" role="status" hidden>
   ✓ 本地控制台已关闭 —— 本页已失效，可关闭此标签页。重新启动：终端运行 <code>mst</code>
 </div>
 
-<main class="wrap">
+<main class="shell" id="main">
 
   <header class="masthead">
-    <h1>会议知识编译台</h1>
+    <div class="mast-title">
+      <h1>会议知识编译台</h1>
+      <p class="mast-trust"><span aria-hidden="true">🔒</span> 全程本地处理 · 无上传 · 逐句原文不可变</p>
+    </div>
     <div class="mast-right">
       <button id="btn-quit" class="btn-quit" type="button"
               title="关闭本地控制台服务（编译中的任务会先确认）">⏻ 关闭服务</button>
@@ -28,84 +33,139 @@
     </div>
   </header>
 
-  <section class="panel" aria-labelledby="h-deps">
-    <h2 id="h-deps">本地依赖自检</h2>
-    <p class="dim">会议材料始终留在本机。安装只会在你点击后执行本地 <code>setup.sh</code>。</p>
-    <div id="dependencies"></div>
-  </section>
+  <div id="deps-banner" class="deps-banner" role="alert" hidden>
+    <span class="deps-banner-icon" aria-hidden="true">⚠</span>
+    <strong>依赖不足</strong>
+    <span id="deps-banner-text"></span>
+    <a href="#env" id="deps-banner-link">查看并安装缺失依赖 →</a>
+  </div>
 
-  <section class="panel" aria-labelledby="h-candidates">
-    <h2 id="h-candidates">多会议候选分组与顺序</h2>
-    <div id="candidates" class="dim">尚未发现候选会议。</div>
-  </section>
+  <nav class="view-nav" aria-label="主导航">
+    <a href="#drop" class="view-tab" data-view="drop">
+      <span class="vt-name">投放</span>
+      <span class="vt-desc">把会议材料放进本机流水线</span>
+    </a>
+    <a href="#track" class="view-tab" data-view="track">
+      <span class="vt-name">进度</span>
+      <span class="vt-desc">编译轨道与队列实时状态</span>
+    </a>
+    <a href="#assembly" class="view-tab" data-view="assembly">
+      <span class="vt-name">装配</span>
+      <span class="vt-desc">乱序片段还原成完整会议</span>
+    </a>
+    <a href="#results" class="view-tab" data-view="results">
+      <span class="vt-name">结果</span>
+      <span class="vt-desc">按会议回查与打包下载</span>
+    </a>
+    <a href="#env" class="view-tab" data-view="env">
+      <span class="vt-name">环境</span>
+      <span class="vt-desc">依赖自检与安装，数据不出本机</span>
+    </a>
+  </nav>
 
-  <section class="panel" aria-labelledby="h-drop">
-    <h2 id="h-drop">投放材料</h2>
-    <div class="drops">
-      <div class="drop-col">
-        <div class="drop" id="drop-audio" role="button" tabindex="0"
-             aria-label="投放录音或录屏文件：把文件拖到这里，或按回车键选择文件，支持多选">
-          <p class="drop-title">把录音 / 录屏文件拖到这里，或点击选择</p>
-          <p class="drop-hint num">m4a · mp3 · wav · aac · flac · aiff · caf · 录屏 mp4 · mov · mkv · webm · m4v</p>
+  <div class="views" id="views">
+
+    <section class="view" id="view-drop" data-view="drop" aria-labelledby="h-drop">
+      <div class="panel" id="drop-panel">
+        <h2 id="h-drop">投放材料</h2>
+        <p class="dim mast-sub">几段打乱的会议录音，还原成各自的完整记录——先从这里开始。</p>
+        <div class="drops">
+          <div class="drop-col">
+            <div class="drop" id="drop-audio" role="button" tabindex="0"
+                 aria-label="投放录音或录屏文件：把文件拖到这里，或按回车键选择文件，支持多选">
+              <p class="drop-title">把录音 / 录屏文件拖到这里，或点击选择</p>
+              <p class="drop-hint num">m4a · mp3 · wav · aac · flac · aiff · caf · 录屏 mp4 · mov · mkv · webm · m4v</p>
+            </div>
+            <ul class="filelist" id="list-audio" aria-label="已选录音文件"></ul>
+          </div>
+          <div class="drop-col">
+            <div class="drop" id="drop-notes" role="button" tabindex="0"
+                 aria-label="投放笔记文件：把 .md 或 .txt 文件拖到这里，或按回车键选择文件，支持多选">
+              <p class="drop-title">把笔记 .md 拖到这里</p>
+              <p class="drop-hint num">md · markdown · txt</p>
+            </div>
+            <ul class="filelist" id="list-notes" aria-label="已选笔记文件"></ul>
+          </div>
         </div>
-        <ul class="filelist" id="list-audio" aria-label="已选录音文件"></ul>
-      </div>
-      <div class="drop-col">
-        <div class="drop" id="drop-notes" role="button" tabindex="0"
-             aria-label="投放笔记文件：把 .md 或 .txt 拖到这里，或按回车键选择文件，支持多选">
-          <p class="drop-title">把笔记 .md 拖到这里</p>
-          <p class="drop-hint num">md · markdown · txt</p>
+        <input type="file" id="pick-audio" class="pick" multiple
+               accept=".m4a,.mp3,.wav,.aac,.flac,.aiff,.caf,.mp4,.mov,.mkv,.webm,.m4v" hidden>
+        <input type="file" id="pick-notes" class="pick" multiple
+               accept=".md,.markdown,.txt" hidden>
+        <div class="controls">
+          <label class="ctl">
+            <span class="ctl-l">会议名称</span>
+            <input type="text" id="event-name" placeholder="如「产品周会-0925」；留空自动生成" autocomplete="off">
+          </label>
+          <label class="ctl">
+            <span class="ctl-l">输出目录</span>
+            <input type="text" id="output-dir" placeholder="默认 outputs/，或点「选择」挑文件夹" autocomplete="off" spellcheck="false">
+          </label>
+          <label class="ctl"><span class="ctl-l"><input id="fragment-mode" type="checkbox"> 散乱多会议片段：每个媒体文件独立解析</span></label>
+          <button id="btn-pick-dir" class="btn btn-ghost" type="button" aria-label="打开系统对话框选择输出文件夹">选择…</button>
+          <button id="btn-start" class="btn btn-primary" type="button">开始编译</button>
+          <button id="btn-stop" class="btn btn-stop" type="button" hidden>停止</button>
         </div>
-        <ul class="filelist" id="list-notes" aria-label="已选笔记文件"></ul>
       </div>
-    </div>
-    <input type="file" id="pick-audio" class="pick" multiple
-           accept=".m4a,.mp3,.wav,.aac,.flac,.aiff,.caf,.mp4,.mov,.mkv,.webm,.m4v" hidden>
-    <input type="file" id="pick-notes" class="pick" multiple
-           accept=".md,.markdown,.txt" hidden>
-    <div class="controls">
-      <label class="ctl">
-        <span class="ctl-l">会议名称</span>
-        <input type="text" id="event-name" placeholder="如「产品周会-0925」；留空自动生成" autocomplete="off">
-      </label>
-      <label class="ctl">
-        <span class="ctl-l">输出目录</span>
-        <input type="text" id="output-dir" placeholder="默认 outputs/，或点「选择」挑文件夹" autocomplete="off" spellcheck="false">
-      </label>
-      <label class="ctl"><span class="ctl-l"><input id="fragment-mode" type="checkbox"> 散乱多会议片段：每个媒体文件独立解析</span></label>
-      <button id="btn-pick-dir" class="btn btn-ghost" type="button" aria-label="打开系统对话框选择输出文件夹">选择…</button>
-      <button id="btn-start" class="btn btn-primary" type="button">开始编译</button>
-      <button id="btn-stop" class="btn btn-stop" type="button" hidden>停止</button>
-    </div>
-  </section>
+    </section>
 
-  <section class="panel" aria-labelledby="h-progress">
-    <h2 id="h-progress">处理进度</h2>
+    <section class="view" id="view-track" data-view="track" aria-labelledby="h-progress" hidden>
+      <div class="panel">
+        <h2 id="h-progress">处理进度</h2>
 
-    <div class="totals" id="totals"></div>
+        <div class="totals" id="totals"></div>
 
-    <div class="track-wrap">
-      <ol class="track" id="track" aria-label="编译阶段轨道，尚未开始"></ol>
-    </div>
-    <p class="track-detail" id="track-detail"><span class="dim">尚未开始编译</span></p>
+        <div class="track-wrap" tabindex="0" role="region" aria-label="处理进度轨道（可左右滚动）">
+          <ol class="track" id="track" aria-label="编译阶段轨道，尚未开始"></ol>
+        </div>
+        <p class="track-detail" id="track-detail"><span class="dim">尚未开始编译</span></p>
 
-    <div class="event-card" id="event-card" hidden></div>
+        <div class="event-card" id="event-card" hidden></div>
 
-    <div class="subblock">
-      <h3>队列</h3>
-      <ul class="queue" id="queue"></ul>
-    </div>
+        <div class="subblock">
+          <h3>队列</h3>
+          <ul class="queue" id="queue"></ul>
+        </div>
 
-    <div class="subblock">
-      <h3>时间线</h3>
-      <ul class="timeline" id="timeline"></ul>
-    </div>
-  </section>
+        <div class="subblock">
+          <h3>时间线</h3>
+          <ul class="timeline" id="timeline"></ul>
+        </div>
+      </div>
+    </section>
 
-  <section class="panel" aria-labelledby="h-results">
-    <h2 id="h-results">结果包</h2>
-    <section id="results-root" class="results-root"></section>
-  </section>
+    <section class="view" id="view-assembly" data-view="assembly" aria-labelledby="h-assembly" hidden>
+      <div class="panel" aria-labelledby="h-candidates">
+        <h2 id="h-candidates">多会议候选分组与顺序</h2>
+        <div id="candidates" class="dim">尚未发现候选会议。</div>
+      </div>
+      <div class="panel" aria-labelledby="h-assembly">
+        <h2 id="h-assembly">散乱片段装配</h2>
+        <p class="dim">以「散乱多会议片段」模式上传并完成编译后，这里生成候选分组与衔接方案；到装配工作台里试听每个分界并确认阅读顺序。</p>
+        <div id="assembly"></div>
+      </div>
+    </section>
+
+    <section class="view" id="view-results" data-view="results" aria-labelledby="h-results" hidden>
+      <div class="panel">
+        <h2 id="h-results">结果包</h2>
+        <section id="results-root" class="results-root"></section>
+      </div>
+    </section>
+
+    <section class="view" id="view-env" data-view="env" aria-labelledby="h-deps" hidden>
+      <div class="panel" id="deps-panel">
+        <h2 id="h-deps">环境自检</h2>
+        <p class="dim">会议材料始终留在本机。安装只会在你点击后执行本地 <code>setup.sh</code>，只从下表各组件的官方地址下载。</p>
+        <p class="fact-chips" role="group" aria-label="本工具的事实承诺">
+          <span class="fact-chip">全程不出本机</span>
+          <span class="fact-chip">逐句原文不可变</span>
+          <span class="fact-chip">16GB 低配机实测不卡死</span>
+        </p>
+        <div id="dependencies"></div>
+      </div>
+    </section>
+
+  </div>
 
   <footer class="foot">本地流水线 · 数据不出本机 · 产物写入 outputs/</footer>
 

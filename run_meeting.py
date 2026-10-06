@@ -187,6 +187,62 @@ def emit_progress(event: str, kind: str, stage: str = "", message: str = "",
         pass
 
 
+def _load_governor():
+    """C2: best-effort import of the resource governor. Protection must
+    never break the pipeline — import failure means ungated (logged once)."""
+    try:
+        webapp_dir = str(WORKSPACE / "webapp")
+        if webapp_dir not in sys.path:
+            sys.path.insert(0, webapp_dir)
+        import resource_governor
+        return resource_governor.get_governor()
+    except Exception as exc:  # pragma: no cover - env-dependent
+        log(f"[governor] 不可用（{exc}），阶段间资源门控停用")
+        return None
+
+
+_GOVERNOR = None
+_GOVERNOR_INIT = False
+
+
+def governor_gate(event: str, label: str) -> None:
+    """Inter-stage resource gate: pause in red zones, adopt slower settings
+    in yellow. Best-effort by design (mirrors emit_progress posture)."""
+    global _GOVERNOR, _GOVERNOR_INIT
+    if not _GOVERNOR_INIT:
+        _GOVERNOR = _load_governor()
+        _GOVERNOR_INIT = True
+    if _GOVERNOR is None:
+        return
+    try:
+        result = _GOVERNOR.gate(label)
+        waited = float(result.get("waited_s") or 0)
+        if waited > 0:
+            emit_progress(event, "governor_wait", label,
+                          f"系统资源紧张（{result.get('zone')}），等待 {waited:.0f}s 后继续"
+                          + ("（等待超时，宁轻微过载不卡死）" if result.get("timed_out") else ""),
+                          counters={"waited_s": round(waited, 1),
+                                    "zone": result.get("zone", "")})
+        degrade = _GOVERNOR.degrade_env()
+        if degrade:
+            for key, value in degrade.items():
+                os.environ.setdefault(key, value)
+            emit_progress(event, "governor_degrade", label,
+                          "内存偏紧：转写线程已调低以保机器稳定（质量不受影响，只影响速度）",
+                          counters=dict(degrade))
+    except Exception:
+        pass
+
+
+def _whisper_threads_arg() -> list[str]:
+    """Honest degrade channel: MST_WHISPER_THREADS (set by the governor in
+    yellow zones or manually) caps whisper.cpp worker threads."""
+    value = (os.environ.get("MST_WHISPER_THREADS") or "").strip()
+    if value.isdigit() and int(value) > 0:
+        return ["-t", value]
+    return []
+
+
 def resolve_output_dir(event: dict) -> Path:
     """Default outputs/<name>; overridable per-event via a web-console-written
     .mst-output.json next to the inputs (dot-file: invisible to
@@ -800,6 +856,7 @@ def _whisper_full_file(run_dir: Path, language: str | None) -> Path | None:
             last = target  # idempotent: keep cached transcript, never re-burn
             continue
         cmd = [str(WHISPER_BIN), "-m", str(WHISPER_MODEL), "-f", str(wav), "-oj", "-of", str(stem)]
+        cmd += _whisper_threads_arg()
         if language:
             cmd += ["--language", language]
         run(cmd, timeout=3600)
@@ -1739,11 +1796,14 @@ def process_event(event: dict, args) -> bool:
 
     manifest = stage_inventory(run_dir, source_dir)
     emit_progress(name, "stage", "video_ingest", "视频分解（音轨/幻灯片）")
+    governor_gate(name, "video_ingest")
     stage_video_ingest(run_dir, manifest, event)
     emit_progress(name, "stage", "audio_prepare", "音频预处理（arnndn RNN 降噪）")
+    governor_gate(name, "audio_prepare")
     stage_audio_prepare(run_dir, manifest)
 
     if not args.skip_asr:
+        governor_gate(name, "asr")
         qwen_json, whisper_json = stage_asr(run_dir, manifest)
     else:
         qwen_json = run_dir / "asr_primary/qwen3_asr_candidates.json"
@@ -1758,8 +1818,10 @@ def process_event(event: dict, args) -> bool:
     emit_progress(name, "stage", "slide_align", "幻灯片对齐")
     stage_slide_align(run_dir, evidence_path, annotated_path)
     emit_progress(name, "stage", "reconcile", "主题提取与索引构建（Ollama）")
+    governor_gate(name, "reconcile")
     reconciled_path = stage_reconcile(run_dir, reconcile_view)
     emit_progress(name, "stage", "audit", "claim 保真审计")
+    governor_gate(name, "audit")
     reconciled_path = stage_audit_claims(run_dir, reconciled_path)
 
     if not args.skip_notes and event["notes"]:
@@ -1811,6 +1873,16 @@ def main():
                     emit_progress(event["name"], "event_failed", status="failed", message="质量门禁未通过")
                 else:
                     emit_progress(event["name"], "event_done", status="done", message="事件完成")
+            except PermissionError as exc:
+                # 沙箱/权限边界要给人话：用户最需要知道"哪里不可写"和"怎么办"，
+                # 而不是裸 errno（真实案例：output_dir 指向沙箱外目录 → EPERM）。
+                friendly = f"权限不足，无法访问 {exc.filename or '目标路径'}。" \
+                    "若这是输出目录，请检查磁盘权限；若在受限环境运行，请把输出目录改到可写位置后重试。"
+                log(f"❌ 事件 {event['name']} 失败: {friendly}")
+                emit_progress(event["name"], "event_failed", status="failed", message=friendly)
+                import traceback
+                traceback.print_exc()
+                failures.append(event["name"])
             except Exception as exc:  # one bad event must not block the rest
                 log(f"❌ 事件 {event['name']} 失败: {exc}")
                 emit_progress(event["name"], "event_failed", status="failed", message=str(exc)[:300])

@@ -1,14 +1,4 @@
-# Install
-
-> **External runtime dependencies:** this repository ships **no** third-party
-> binaries or model weights. Everything below (FFmpeg, whisper.cpp + GGML
-> model, Qwen3-ASR, Ollama + qwen3:8b) is installed/downloaded by you from
-> its **official source**; each component's license applies independently and
-> is yours to read and accept. See THIRD_PARTY_NOTICES.md. / 安装
-
-**Fast path / 快速路径:** `./setup.sh` automates every step below (deps,
-models, `config.json`, global `mst` command, verification) — idempotent,
-resumable. The rest of this document is the manual equivalent.
+# Install / 安装
 
 macOS-first guide. Python **3.10+**, and everything below stays on your
 machine. 中文要点见文末。
@@ -20,16 +10,21 @@ brew install ffmpeg            # ffmpeg + ffprobe: audio prep, durations
 ```
 
 Optional: if you already use the `arnndn` FFmpeg denoiser model, place
-`cb.rnnn` in `~/.local/share/arnndn/` (**not distributed here; upstream
-license UNCONFIRMED — review it yourself**). The pipeline detects it automatically;
+`cb.rnnn` in `~/.local/share/arnndn/`. The pipeline detects it automatically;
 when it is absent, denoising is skipped and the pipeline continues. This model
 is not bundled or downloaded by this repository.
 
-Clone and check the test suite (no models needed yet):
+Clone and check the test suite (no models needed yet). Run from the project root:
 
 ```bash
-python3 -m unittest discover tests   # expect: OK
+python3 -m unittest discover -s tests -t .   # expect: OK — 343 tests
 ```
+
+A clean tree reports `OK` with skips (0 failures). Skipped cases need **optional
+dev dependencies**, not models: `numpy`+`opencv-python-headless` (the project's
+`vendor/tools-venv`, installed by `setup.sh` step 5) and `ffmpeg`/`ffprobe` on
+PATH for the video-slide cases; `pypinyin` for the homophone-OCR contrast cases.
+Install those and re-run to execute the full set.
 
 ## 2. whisper.cpp (required — ASR base engine)
 
@@ -85,25 +80,9 @@ cp config.example.json config.json
 `config.json` is gitignored — it is the only file that ever holds your
 local paths. Every key can also come from an env var (`MST_WHISPER_BIN`,
 `MST_WHISPER_MODEL`, `MST_QWEN_PYTHON`, `MST_OLLAMA_URL`, `MST_OLLAMA_MODEL`).
-The web console can open before these are ready and shows a local dependency
-checklist; required items unlock processing, while Qwen3-ASR and video tools
-are optional enhancements.
+Missing keys produce one collective error listing everything.
 
-## 6. Run the web console (or the CLI)
-
-```bash
-python3 start.py            # web console at http://127.0.0.1:8788 (auto-opens)
-python3 run_meeting.py      # one serial CLI pass over input/ (unchanged v0.1 behavior)
-```
-
-The console binds to 127.0.0.1 only (no auth — keep it local). For recording
-videos, `./setup.sh` also creates `vendor/tools-venv` with NumPy, OpenCV and
-pypinyin. The page asks you to confirm an automatically detected slide region
-before a video batch starts. See
-PRIVACY_AND_DATA_FLOW.md for the `_private` visibility semantics across
-MCP / CLI / web.
-
-## 7. Verify with the demo event
+## 6. Verify with the demo event
 
 ```bash
 bash scripts/demo.sh
@@ -121,10 +100,3 @@ IDs. macOS only (`say`); on Linux, drop any short wav + notes.md into
    `config.example.json` 为 `config.json` 填路径（环境变量亦可）；
 6. `bash scripts/demo.sh` 跑合成 demo 验证全链路。所有阶段全本地，
    录音内容不出本机。
-
-## License / 使用范围
-
-本仓库为 source-available（PolyForm Noncommercial 1.0.0），**非** OSI 开源许可。
-非商业使用按 [LICENSE](LICENSE) 直接进行，**无需申请**；商业使用**不由本仓库
-许可证授权**，须先通过 GitHub Issue 取得单独书面许可：
-[COMMERCIAL_LICENSING.md](COMMERCIAL_LICENSING.md)。

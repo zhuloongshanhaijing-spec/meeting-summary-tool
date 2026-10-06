@@ -50,10 +50,8 @@ if ! command -v python3 >/dev/null 2>&1; then
     echo "✗ 未找到 python3 —— 请先安装 Python 3" >&2
     exit 1
 fi
-# 默认入口 = 网页控制台；纯 CLI 编译入口：MST_ENTRY=run_meeting.py ./install.sh
-ENTRY=${MST_ENTRY:-start.py}
-if [ ! -f "$REPO/$ENTRY" ]; then
-    echo "✗ 仓库不完整：缺 ${ENTRY}（${REPO}）" >&2
+if [ ! -f "$REPO/start.py" ]; then
+    echo "✗ 仓库不完整：缺 start.py（${REPO}）" >&2
     exit 1
 fi
 
@@ -61,9 +59,9 @@ fi
 mkdir -p -- "$BIN_DIR"
 cat > "$LAUNCHER" <<EOF
 #!/bin/sh
-# mst — Meeting Summary Tool（由 install.sh 生成，入口：${ENTRY}）
-# 用法：mst [--port N] [--no-browser]（透传给 ${ENTRY}）
-exec /usr/bin/env python3 "$REPO/$ENTRY" "\$@"
+# mst — Meeting Summary Tool 网页控制台（由 install.sh 生成）
+# 用法：mst [--port N] [--no-browser]
+exec /usr/bin/env python3 "$REPO/start.py" "\$@"
 EOF
 chmod 755 "$LAUNCHER"
 
@@ -93,5 +91,5 @@ case "$path_ok" in
     0) echo "✓ 已把 $BIN_DIR 写入 ${rc_name}（新终端生效，或先 source 一次）" ;;
 esac
 echo
-echo "现在可以一条命令启动：  mst   （入口：${ENTRY}）"
-echo "（等价于 python3 \"$REPO/$ENTRY\"，支持 --port N / --no-browser）"
+echo "现在可以一条命令启动：  mst"
+echo "（等价于 python3 \"$REPO/start.py\"，支持 --port N / --no-browser）"

@@ -129,6 +129,34 @@ def main() -> int:
             raise RuntimeError(f"server did not come up: {out[-500:]}")
         log("服务就绪")
 
+        # -- 2.5 new-surface checks (no models needed) -----------------------
+        log("新面自检：依赖字段 / 装配面 / 治理器快照…")
+        code, deps = api_json(base, "/api/dependencies")
+        if code != 200:
+            failures.append(f"/api/dependencies -> {code}")
+        else:
+            for item in deps.get("items", []):
+                for key in ("detail", "consequence", "required", "official_url", "purpose"):
+                    if key not in item:
+                        failures.append(f"dependency item {item.get('id')} missing {key}")
+        code, install_log = api_json(base, "/api/dependencies/install-log")
+        if code != 200 or not {"installing", "ids", "error", "tail"} <= set(install_log):
+            failures.append(f"/api/dependencies/install-log shape wrong: {install_log}")
+        code, asm = api_json(base, "/api/assembly")
+        if code != 200 or "status" not in asm:
+            failures.append(f"/api/assembly -> {code} {asm}")
+        code, payload = api_json(base, "/api/assembly/build", "POST", b"")
+        has_fragments = RUNS.exists() and any(
+            p.is_dir() and p.name.startswith("fragment-") for p in RUNS.iterdir())
+        if not has_fragments and code != 409:
+            failures.append(f"assembly/build without fragments should 409, got {code}")
+        code, status0 = api_json(base, "/api/status")
+        if "governor" not in status0:
+            failures.append("/api/status missing governor snapshot field")
+        if "assembly" not in status0:
+            failures.append("/api/status missing assembly field")
+        log("新面自检完成")
+
         # -- 3. upload via HTTP ---------------------------------------------
         payload = multipart(
             {"event": main_event, "output_dir": ""},
@@ -225,6 +253,33 @@ def main() -> int:
                         failures.append(f"zip suspiciously small: {zf.namelist()}")
                 except zipfile.BadZipFile:
                     failures.append("zip body not a valid zip")
+
+        # -- 5.5 audio Range streaming (junction audition backend) -----------
+        src_dir = RUNS / main_event / "source"
+        wavs = sorted(src_dir.glob("*.wav")) if src_dir.is_dir() else []
+        if not wavs:
+            failures.append(f"no source audio under {src_dir} for audio route")
+        else:
+            import urllib.error
+            url = (base + "/api/audio/" + urllib.request.quote(main_event)
+                   + "/" + urllib.request.quote(wavs[0].name))
+            req = urllib.request.Request(url, headers={"Range": "bytes=0-99"})
+            try:
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    body = resp.read()
+                    cr = resp.headers.get("Content-Range", "")
+                if resp.status != 206 or len(body) != 100 or "/".encode() not in cr.encode():
+                    failures.append(f"audio Range: status={resp.status} len={len(body)} cr={cr!r}")
+            except urllib.error.HTTPError as exc:
+                failures.append(f"audio Range request failed: {exc.code}")
+            # traversal defense
+            bad = base + "/api/audio/" + urllib.request.quote(main_event) + "/..%2F..%2Fconfig.json"
+            try:
+                with urllib.request.urlopen(bad, timeout=10) as resp:
+                    if resp.status == 200:
+                        failures.append("audio route traversal NOT blocked")
+            except urllib.error.HTTPError:
+                pass  # 4xx is the expectation
 
         # -- 6. stop semantics on a second event -------------------------------
         log("第二事件：验证停止语义…")

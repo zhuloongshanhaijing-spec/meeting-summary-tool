@@ -2,6 +2,9 @@
 locally gated until dependencies and a multi-meeting order are confirmed."""
 from __future__ import annotations
 
+import json
+import os
+import time
 import sys
 import tempfile
 import unittest
@@ -100,7 +103,36 @@ class CandidatePlanTest(unittest.TestCase):
             self.assertGreater(plan["groups"][0]["fragments"][0]["note_hint_score"], 0)
 
 
+    def test_fragment_runs_are_not_meeting_candidates(self):
+        """Fragment events belong to the assembly workbench; they must never
+        pollute the whole-meeting candidate list (and trip its confirm gate)."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            input_dir = root / "input"
+            runs = root / "runs"
+            for name in ("fragment-1000-1", "meeting-a"):
+                d = input_dir / name
+                d.mkdir(parents=True)
+                f = d / "clip.m4a"
+                f.write_bytes(b"x")
+                run = runs / name
+                run.mkdir(parents=True)
+                (run / "literal_records.jsonl").write_text('{"text":"x"}\n', encoding="utf-8")
+                (run / "manifest.json").write_text('{"file_count": 1}', encoding="utf-8")
+            with mock.patch.object(server, "INPUT_DIR", input_dir), \
+                 mock.patch.object(server, "RUNS_DIR", runs), \
+                 mock.patch.object(server, "PROGRESS_JSONL", root / "runs" / "progress.jsonl"), \
+                 mock.patch.object(server, "DEPENDENCY_PLAN", input_dir / ".meeting-plan.json"):
+                plan = server.candidate_plan()
+                self.assertEqual([x["event"] for x in plan["candidates"]], ["meeting-a"])
+
+
 class DependencyStatusTest(unittest.TestCase):
+    def setUp(self):
+        # 依赖状态带 20s TTL 进程内缓存（探测是秒级开销，/api/status 每秒轮询
+        # 不能每次冷启动子进程）；单测需要每次都真实探测，先清缓存。
+        server._dep_cache.update({"ts": 0.0, "payload": None, "dirty": False})
+
     def test_status_has_local_only_purpose_required_and_official_link(self):
         payload = server.dependency_status()
         self.assertTrue(payload["local_only"])
@@ -109,6 +141,15 @@ class DependencyStatusTest(unittest.TestCase):
             self.assertTrue(item["purpose"])
             self.assertTrue(item["official_url"].startswith("https://"))
             self.assertIsInstance(item["required"], bool)
+
+    def test_items_carry_detail_and_consequence_for_honest_ui(self):
+        for item in server.dependency_status()["items"]:
+            self.assertTrue(item["detail"], item["id"])
+            self.assertTrue(item["consequence"], item["id"])
+        # qwen 是中文增强件而非「仅录屏可选」——文案口径不得再误导
+        qwen = next(x for x in server.dependency_status()["items"] if x["id"] == "qwen")
+        self.assertIn("中文", qwen["purpose"])
+        self.assertFalse(qwen["required"])
 
     def test_whisper_model_and_ollama_tag_are_required_for_ready(self):
         with tempfile.TemporaryDirectory() as td:
@@ -122,14 +163,14 @@ class DependencyStatusTest(unittest.TestCase):
             response.__enter__.return_value = response
             with mock.patch.object(config, "resolve", return_value=cfg), \
                  mock.patch.object(server.urllib.request, "urlopen", return_value=response):
-                ready = {x["id"]: x["ready"] for x in server.dependency_status()["items"]}
+                ready = {x["id"]: x["ready"] for x in server.dependency_status(force=True)["items"]}
             self.assertTrue(ready["whisper"])
             self.assertTrue(ready["ollama"])
             model.unlink()
             response.read.return_value = b'{"models": []}'
             with mock.patch.object(config, "resolve", return_value=cfg), \
                  mock.patch.object(server.urllib.request, "urlopen", return_value=response):
-                missing = {x["id"]: x["ready"] for x in server.dependency_status()["items"]}
+                missing = {x["id"]: x["ready"] for x in server.dependency_status(force=True)["items"]}
             self.assertFalse(missing["whisper"])
             self.assertFalse(missing["ollama"])
 
@@ -141,14 +182,124 @@ class DependencyStatusTest(unittest.TestCase):
             passed = mock.Mock(returncode=0)
             with mock.patch.object(config, "resolve", return_value=cfg), \
                  mock.patch.object(server.subprocess, "run", return_value=failed):
-                states = {x["id"]: x["ready"] for x in server.dependency_status()["items"]}
+                states = {x["id"]: x["ready"] for x in server.dependency_status(force=True)["items"]}
             self.assertFalse(states["qwen"])
             with mock.patch.object(config, "resolve", return_value=cfg), \
                  mock.patch.object(server.subprocess, "run", return_value=passed) as probe:
-                states = {x["id"]: x["ready"] for x in server.dependency_status()["items"]}
+                states = {x["id"]: x["ready"] for x in server.dependency_status(force=True)["items"]}
             self.assertTrue(states["qwen"])
             self.assertIn("local_files_only=True", probe.call_args.args[0][-1])
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AssemblyPlanTest(unittest.TestCase):
+    """A2 wiring: v2 plan state, build gate, and confirm sidecar."""
+
+    def _seed_plan(self, root):
+        runs = root / "runs"
+        runs.mkdir(parents=True, exist_ok=True)
+        plan = {
+            "kind": "fragment_assembly_plan", "status": "draft", "generated_ts": 1.0,
+            "fragments": [{"id": "fragment-1", "source": "a.m4a"}],
+            "groups": [{"group_id": "g01", "fragment_ids": ["fragment-1"],
+                        "confidence": "high"}],
+            "junctions": [], "notice": "n",
+        }
+        (runs / ".assembly-plan.json").write_text(
+            json.dumps(plan, ensure_ascii=False), encoding="utf-8")
+        return runs
+
+    def test_absent_plan_reports_honest_placeholder(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            with mock.patch.object(server, "RUNS_DIR", root / "runs"):
+                payload = server.assembly_plan()
+        self.assertEqual(payload["status"], "absent")
+        self.assertFalse(payload.get("confirmed", False))
+
+    def test_confirm_writes_sidecar_and_reflects_state(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            runs = self._seed_plan(root)
+            with mock.patch.object(server, "RUNS_DIR", runs), \
+                 mock.patch.object(server, "ROOT", root):
+                code, payload = server.confirm_assembly(["fragment-1"])
+                self.assertEqual(code, 200)
+                state = server.assembly_plan()
+                self.assertTrue(state["confirmed"])
+                # mismatch → 400 and state unchanged
+                code2, _ = server.confirm_assembly(["fragment-2"])
+                self.assertEqual(code2, 400)
+                self.assertTrue(server.assembly_plan()["confirmed"])
+
+    def test_build_refuses_without_fragment_runs(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            runs = root / "runs"
+            runs.mkdir(parents=True)
+            with mock.patch.object(server, "RUNS_DIR", runs), \
+                 mock.patch.object(server, "ROOT", root):
+                code, payload = server.build_assembly()
+        self.assertEqual(code, 409)
+        self.assertIn("fragment", payload["error"])
+
+    def test_build_passes_ollama_model_from_env(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            runs = root / "runs"
+            (runs / "fragment-x").mkdir(parents=True)
+            captured = {}
+            with mock.patch.object(server, "RUNS_DIR", runs), \
+                 mock.patch.object(server, "ROOT", root), \
+                 mock.patch.object(server.subprocess, "Popen",
+                                   wraps=server.subprocess.Popen) as popen:
+                def capture(cmd, **kw):
+                    captured["cmd"] = cmd
+                    return mock.Mock(poll=lambda: None)
+                popen.side_effect = capture
+                old = os.environ.pop("MST_OLLAMA_MODEL", None)
+                try:
+                    code, _ = server.build_assembly()
+                    self.assertEqual(code, 202)
+                    self.assertNotIn("--ollama-model", captured["cmd"])
+                    os.environ["MST_OLLAMA_MODEL"] = "qwen3-vl:4b-instruct"
+                    code, _ = server.build_assembly()  # 409: already building
+                    # 仍需验证 env 生效路径：重置 proc 后再来一次
+                    server._assembly["proc"] = None
+                    code, _ = server.build_assembly()
+                    self.assertEqual(code, 202)
+                    self.assertIn("--ollama-model", captured["cmd"])
+                    self.assertEqual(
+                        captured["cmd"][captured["cmd"].index("--ollama-model") + 1],
+                        "qwen3-vl:4b-instruct")
+                finally:
+                    server._assembly["proc"] = None   # 不污染后续用例的全局构建态
+                    if old is None:
+                        os.environ.pop("MST_OLLAMA_MODEL", None)
+                    else:
+                        os.environ["MST_OLLAMA_MODEL"] = old
+
+
+class AsyncDepSummaryTest(unittest.TestCase):
+    """P0 回归：/api/status 绝不为依赖探测阻塞（冷读返回探测中占位）。"""
+
+    def test_cold_read_is_instant_and_probing(self):
+        server._dep_cache.update({"ts": 0.0, "payload": None, "dirty": False})
+        t0 = time.time()
+        d = server.dependency_summary_cached()
+        self.assertLess(time.time() - t0, 0.5)
+        self.assertTrue(d["probing"])
+        self.assertEqual(d["items"], [])
+
+    def test_warm_read_serves_cache_without_probing(self):
+        server._dep_cache.update({
+            "ts": time.time(),
+            "payload": {"items": [{"id": "ffmpeg", "ready": True}], "local_only": True},
+            "dirty": False})
+        d = server.dependency_summary_cached()
+        self.assertNotIn("probing", d)
+        self.assertEqual(d["items"][0]["id"], "ffmpeg")
+        server._dep_cache.update({"ts": 0.0, "payload": None, "dirty": False})

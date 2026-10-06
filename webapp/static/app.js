@@ -37,7 +37,7 @@
   var els = {
     offline: $("offline"), pid: $("pid"), badge: $("badge"), badgeText: $("badge-text"),
     totals: $("totals"), track: $("track"), detail: $("track-detail"),
-    dependencies: $("dependencies"), candidates: $("candidates"),
+    dependencies: $("dependencies"), candidates: $("candidates"), assembly: $("assembly"),
     eventCard: $("event-card"), queue: $("queue"), timeline: $("timeline"),
     eventName: $("event-name"), outputDir: $("output-dir"), fragmentMode: $("fragment-mode"),
     pickDir: $("btn-pick-dir"),
@@ -172,6 +172,31 @@
 
   /* ---- 状态渲染 --------------------------------------------------------- */
 
+  /* ---- 多视图路由（无滚动壳）：hash 驱动，深链/后退可用 ---- */
+  var VIEWS = ["drop", "track", "assembly", "results", "env"];
+  var currentView = "drop";
+  function switchView(name) {
+    if (VIEWS.indexOf(name) < 0) name = "drop";
+    currentView = name;
+    var tabs = document.querySelectorAll(".view-tab");
+    for (var i = 0; i < tabs.length; i++) {
+      if (tabs[i].getAttribute("data-view") === name) tabs[i].setAttribute("aria-current", "page");
+      else tabs[i].removeAttribute("aria-current");
+    }
+    var secs = document.querySelectorAll(".view");
+    for (var j = 0; j < secs.length; j++) {
+      secs[j].hidden = secs[j].getAttribute("data-view") !== name;
+    }
+    /* 程序化切换后同步地址栏（replaceState：不加历史项、不触发 hashchange 回环） */
+    if (location.hash !== "#" + name) {
+      try { history.replaceState(null, "", "#" + name); } catch (e) {}
+    }
+  }
+  window.addEventListener("hashchange", function () {
+    switchView((location.hash || "#drop").slice(1));
+  });
+  switchView((location.hash || "#drop").slice(1));
+
   function render(status) {
     lastStatus = status;
     renderBadge(status);
@@ -182,28 +207,169 @@
     renderTimeline(status.recent || []);
     renderDependencies(status.dependencies || {});
     renderCandidates(status.candidate_plan || {});
-    renderFragmentPlan(status.fragment_plan || {});
+    renderAssembly(status.assembly || {});
+    renderFragmentPlan(status.fragment_plan || {}, status.assembly || {});
     syncControls();
   }
+
+  function renderAssembly(plan) {
+    if (!els.assembly) return;
+    if (!plan || plan.status === "absent") {
+      if (plan && plan.building) {
+        els.assembly.innerHTML = '<p class="qrow">装配分析进行中…（本地模型逐对判读，通常 1–3 分钟）</p>';
+        return;
+      }
+      var fc = plan && plan.fragment_count;
+      if (fc > 0) {
+        els.assembly.innerHTML =
+          '<p class="qrow">检测到 <span class="num">' + fc + '</span> 个已编译的散乱片段，还没有装配计划。</p>' +
+          (plan && plan.error ? '<p class="modal-error">' + esc(plan.error) + "</p>" : "") +
+          '<button id="btn-assembly-build" class="btn btn-primary" type="button">生成装配计划</button>';
+        var b0 = $("btn-assembly-build");
+        if (b0) b0.addEventListener("click", function () {
+          fetch("/api/assembly/build", {method: "POST"}).then(function (r) { return r.json(); })
+            .then(function (d) { toast(d.message || d.error || "已提交", d.error ? "error" : ""); poll(); });
+        });
+      } else {
+        els.assembly.innerHTML = '<p class="dim">尚无碎片事件。到「投放」视图勾选「散乱多会议片段」后上传即可。</p>';
+      }
+      return;
+    }
+    var groupCount = (plan.groups || []).length;
+    var fragCount = (plan.fragments || []).length;
+    els.assembly.innerHTML =
+      '<p class="qrow">已有装配计划：' + groupCount + " 组 / " + fragCount + " 片段 · " +
+      (plan.confirmed ? "已确认" : "待审核") + (plan.building ? " · 分析中…" : "") + "</p>" +
+      (plan.error ? '<p class="modal-error">' + esc(plan.error) + "</p>" : "") +
+      '<button id="btn-assembly-build" class="btn btn-ghost" type="button"' + (plan.building ? " disabled" : "") + ">" +
+      (plan.building ? "分析中…" : "生成 / 重新生成装配计划") + "</button> " +
+      '<a class="btn btn-ghost asm-open" href="/static/assembly.html">打开装配工作台</a>';
+    var btn = $("btn-assembly-build");
+    if (btn) btn.addEventListener("click", function () {
+      fetch("/api/assembly/build", {method: "POST"}).then(function (r) { return r.json(); })
+        .then(function (d) { toast(d.message || d.error || "已提交", d.error ? "error" : ""); poll(); });
+    });
+  }
+
+  var depsGateBlocked = false;   /* 必需依赖缺失时打灰投放/编译区 */
+  var installLogTimer = null;
+  var lastInstallTail = "";
+  var depOpenSet = {};           /* 展开状态跨轮询记忆（1s 重渲染不清场） */
 
   function renderDependencies(deps) {
     if (!els.dependencies) return;
     var items = deps.items || [];
+    if (deps.probing) {
+      /* 后台探测中：不拦门（未知 ≠ 缺失），给用户明确的等待反馈 */
+      els.dependencies.innerHTML = '<p class="dim">正在检测本机依赖…（只做本机探测，不上传任何数据；几秒后自动出现结果）</p>';
+      renderDepsGate([], deps);
+      return;
+    }
+    var missingRequired = items.filter(function (d) { return d.required && !d.ready; });
+    var missingAny = items.filter(function (d) { return !d.ready; });
     els.dependencies.innerHTML = items.map(function (d) {
-      var state = d.ready ? "已就绪" : (d.required ? "缺失（必需）" : "缺失（仅录屏可选）");
-      return '<p class="qrow"><label><input class="dep-choice" type="checkbox" value="' + esc(d.id) + '"' + (!d.ready ? " checked" : " disabled") + '> <strong>' + esc(d.id) + '</strong></label> · ' + esc(d.tier) + ' · ' + esc(d.purpose) +
-        ' · ' + esc(d.download) + ' · ' + state + ' · <a href="' + esc(d.official_url) + '" target="_blank" rel="noreferrer">官方链接</a></p>';
-    }).join("") + '<button id="btn-install-deps" class="btn btn-ghost" type="button"' +
-      (deps.installing ? " disabled" : "") + '>' + (deps.installing ? "本地安装中…" : "安装缺失依赖") + "</button>" +
+      var state = d.ready
+        ? '<span class="dep-state dep-state-ok">✓ 已就绪</span>'
+        : (d.required ? '<span class="dep-state dep-state-req">缺失 · 必需</span>'
+                      : '<span class="dep-state dep-state-opt">未安装 · 可选</span>');
+      var pick = d.ready ? "" :
+        '<label class="dep-pick"><input class="dep-choice" type="checkbox" value="' + esc(d.id) + '"' +
+        (deps.installing ? "" : " checked") + '> 安装</label>';
+      var open = !!depOpenSet[d.id];
+      return '<div class="dep-card' + (d.ready ? " dep-ready" : (d.required ? " dep-req-miss" : " dep-opt-miss")) + '">' +
+        '<div class="dep-row">' +
+        '<button class="dep-name" type="button" aria-expanded="' + (open ? "true" : "false") + '" aria-controls="dep-detail-' + esc(d.id) + '" data-dep-toggle="' + esc(d.id) + '"' +
+        ' title="点开查看它是什么、缺了会怎样">' + esc(d.id) + '<span class="dep-caret" aria-hidden="true">▾</span></button>' +
+        '<span class="dep-tier">' + esc(d.tier) + '</span>' +
+        '<span class="dep-purpose">' + esc(d.purpose) + '</span>' +
+        state + pick +
+        '<span class="dep-size num">' + esc(d.download) + '</span>' +
+        '<a class="dep-link" href="' + esc(d.official_url) + '" target="_blank" rel="noreferrer">官方页面 ↗</a>' +
+        '</div>' +
+        '<div class="dep-detail" id="dep-detail-' + esc(d.id) + '"' + (open ? "" : " hidden") + '>' +
+        '<p><strong>它是什么：</strong>' + esc(d.detail || "（说明未随本机清单提供）") + '</p>' +
+        '<p><strong>缺了会怎样：</strong>' + esc(d.consequence || "（影响未随本机清单提供）") + '</p>' +
+        '<p class="dep-verify dim">安全性自证：本工具与以上组件全部只在本机运行，会议内容不出本机；「官方页面」指向组件官方仓库或官网，可自行核对来源与代码。安装日志只记录对这些官方地址的下载，就在下方可见。</p>' +
+        '</div></div>';
+    }).join("") +
+      '<div class="dep-actions">' +
+      '<button id="btn-install-deps" class="btn btn-primary" type="button"' + (deps.installing ? " disabled" : "") + '>' +
+      (deps.installing ? "安装中…" : "安装勾选的依赖") + "</button>" +
+      (missingAny.length ? '<button id="btn-install-all" class="btn btn-ghost" type="button"' + (deps.installing ? " disabled" : "") + '>勾选全部缺失项</button>' : "") +
+      '<span class="dep-note dim">安装 = 在本机运行 <code>setup.sh</code>，只下载上表官方组件。</span>' +
+      "</div>" +
+      '<pre id="install-log" class="install-log num" hidden></pre>' +
       (deps.error ? '<p class="modal-error">' + esc(deps.error) + "</p>" : "");
-    var btn = $("btn-install-deps");
-    if (btn) btn.addEventListener("click", function () {
-      var missing = Array.prototype.map.call(document.querySelectorAll(".dep-choice:checked"), function (x) { return x.value; });
-      if (!missing.length) { toast("依赖已全部就绪"); return; }
-      fetch("/api/dependencies/install", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({ids: missing})})
+    Array.prototype.forEach.call(els.dependencies.querySelectorAll("[data-dep-toggle]"), function (btn) {
+      btn.addEventListener("click", function () {
+        var depId = btn.getAttribute("data-dep-toggle");
+        var panel = document.getElementById("dep-detail-" + depId);
+        if (!panel) return;
+        var open = panel.hasAttribute("hidden");
+        if (open) { panel.removeAttribute("hidden"); depOpenSet[depId] = true; }
+        else { panel.setAttribute("hidden", ""); depOpenSet[depId] = false; }
+        btn.setAttribute("aria-expanded", open ? "true" : "false");
+      });
+    });
+    var installBtn = $("btn-install-deps");
+    if (installBtn) installBtn.addEventListener("click", function () {
+      var chosen = Array.prototype.map.call(document.querySelectorAll(".dep-choice:checked"), function (x) { return x.value; });
+      if (!chosen.length) { toast("缺失的依赖已全部就绪", ""); return; }
+      fetch("/api/dependencies/install", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({ids: chosen})})
         .then(function (r) { return r.json(); }).then(function (d) { toast(d.message || d.error || "已提交安装", d.error ? "error" : ""); poll(); })
         .catch(function () { toast("无法启动本地安装", "error"); });
     });
+    var allBtn = $("btn-install-all");
+    if (allBtn) allBtn.addEventListener("click", function () {
+      Array.prototype.forEach.call(document.querySelectorAll(".dep-choice"), function (x) { x.checked = true; });
+    });
+    renderDepsGate(missingRequired, deps);
+  }
+
+  function renderDepsGate(missingRequired, deps) {
+    depsGateBlocked = missingRequired.length > 0;
+    var banner = $("deps-banner");
+    var bannerText = $("deps-banner-text");
+    if (banner) banner.hidden = !depsGateBlocked;
+    if (bannerText) bannerText.textContent = depsGateBlocked
+      ? "缺少必需依赖：" + missingRequired.map(function (d) { return d.id; }).join("、") + " —— 安装完成后即可投放材料并开始编译，装好无需刷新页面，界面会自动恢复。"
+      : "";
+    var dropPanel = $("drop-panel");
+    if (dropPanel) {
+      dropPanel.classList.toggle("dimmed", depsGateBlocked);
+      dropPanel.setAttribute("aria-disabled", depsGateBlocked ? "true" : "false");
+    }
+    [els.eventName, els.outputDir, els.fragmentMode, els.pickDir].forEach(function (el) {
+      if (el) el.disabled = depsGateBlocked;
+    });
+    syncControls();
+    syncInstallLog(deps);
+  }
+
+  function showInstallTail(tail) {
+    lastInstallTail = tail || lastInstallTail;
+    var box = $("install-log");
+    if (box && lastInstallTail) {
+      box.textContent = lastInstallTail;
+      box.removeAttribute("hidden");
+      box.scrollTop = box.scrollHeight;
+    }
+  }
+
+  function syncInstallLog(deps) {
+    if (deps.installing && !installLogTimer) {
+      installLogTimer = setInterval(function () { poll(); }, 2000);
+    } else if (!deps.installing && installLogTimer) {
+      clearInterval(installLogTimer);
+      installLogTimer = null;
+      /* 安装刚结束：主动同步探测一次（服务端缓存已 dirty），立即拿真状态渲染，
+         不等 /api/status 的缓存自然过期——「装好界面自动恢复」的落点 */
+      fetch("/api/dependencies?refresh=1").then(function (r) { return r.json(); })
+        .then(function (d) { renderDependencies(d || {}); }).catch(function () {});
+    }
+    fetch("/api/dependencies/install-log").then(function (r) { return r.json(); }).then(function (d) {
+      showInstallTail(d.tail);
+    }).catch(function () {});
   }
 
   function renderCandidates(plan) {
@@ -220,8 +386,9 @@
     });
   }
 
-  function renderFragmentPlan(plan) {
+  function renderFragmentPlan(plan, assembly) {
     if (!els.candidates || !(plan.groups || []).length) return;
+    if (assembly && assembly.status !== "absent") return;  /* v2 工作台已接管 */
     var html = '<h3>散乱片段阅读顺序（本地候选）</h3>' + plan.groups.map(function (g) {
       return '<p class="qrow">' + g.fragments.map(function (f) { return esc(f.source) + '（' + Math.round(f.duration_seconds) + 's）'; }).join(' → ') + (g.gap_or_uncertain ? ' · 低置信：可能有缺段或不相关片段' : ' · 候选连续') + (g.note_order_hint != null ? ' · 笔记低置信顺序提示' : '') + '</p>';
     }).join('') + ((plan.references || []).length ? '<p class="qrow">本地参考笔记：' + esc(plan.references.join('、')) + '（仅作线索，不补写内容）</p>' : '') + '<p class="modal-warn">' + esc(plan.notice || '') + '</p>' + (!plan.confirmed ? '<button id="btn-confirm-fragments" class="btn btn-ghost" type="button">确认阅读顺序清单</button>' : '');
@@ -394,7 +561,8 @@
   function syncControls() {
     var running = !!(lastStatus && lastStatus.running);
     els.btnStop.hidden = !running;
-    if (uploading) { els.btnStart.disabled = true; els.btnStart.textContent = "上传中…"; }
+    if (depsGateBlocked) { els.btnStart.disabled = true; els.btnStart.textContent = "依赖未就绪"; }
+    else if (uploading) { els.btnStart.disabled = true; els.btnStart.textContent = "上传中…"; }
     else if (running) { els.btnStart.disabled = true; els.btnStart.textContent = "编译中…"; }
     else { els.btnStart.disabled = false; els.btnStart.textContent = "开始编译"; }
   }
@@ -418,6 +586,14 @@
     sel.audio.forEach(function (f) { fd.append("audio", f, f.name); });
     sel.notes.forEach(function (f) { fd.append("notes", f, f.name); });
 
+    /* 队列扫旧守门（E2E 实测缺陷：/api/start 会处理整个队列，含历史遗留事件）：
+       上传前后各取一次队列做差集，若有其他待处理事件则先确认再启动。 */
+    var queueSnapshot = fetch("/api/status").then(function (r) { return r.json(); })
+      .then(function (d) {
+        return (d.queue || []).map(function (q) { return q.event || q.name || ""; });
+      })
+      .catch(function () { return null; });
+
     fetch("/api/upload", { method: "POST", body: fd })
       .then(function (res) {
         return res.json().catch(function () { return {}; }).then(function (data) {
@@ -433,16 +609,43 @@
         sel.audio = []; sel.notes = [];
         renderFileList("audio"); renderFileList("notes");
         els.eventName.value = "";
-        return fetch("/api/start", { method: "POST" }).then(function (res) {
-          return res.json().catch(function () { return {}; }).then(function (data) {
-            return { code: res.status, data: data };
+        /* 队列扫旧守门：先存事件 = 上传前就已在队列者（与本次上传新增无关，碎片模式免疫） */
+        function doStart() {
+          return fetch("/api/start", { method: "POST" }).then(function (res) {
+            return res.json().catch(function () { return {}; }).then(function (data) {
+              return { code: res.status, data: data };
+            });
           });
+        }
+        return queueSnapshot.then(function (before) {
+          return fetch("/api/status").then(function (r2) { return r2.json(); })
+            .catch(function () { return {}; })
+            .then(function (d2) {
+              var after = (d2.queue || []).map(function (q) { return q.event || q.name || ""; });
+              var others = before ? after.filter(function (n) {
+                return n && before.indexOf(n) >= 0;
+              }) : [];
+              if (!others.length) return doStart();
+              var names = others.slice(0, 3).join("、") + (others.length > 3 ? " 等" : "");
+              return new Promise(function (resolve) {
+                appConfirm("队列里还有此前待处理的 " + others.length + " 个事件（" + names +
+                  "）。开始编译会把它们一并处理。", "仍要开始",
+                  function () { resolve(doStart()); },
+                  function () { resolve({ code: 0, data: { cancelled: true } }); });
+              });
+            });
         });
       })
       .then(function (r) {
         if (!r) return;
+        if (r.data && r.data.cancelled) {
+          toast("已取消启动：刚上传的事件仍在队列里，可稍后再开始编译。");
+          poll();
+          return;
+        }
         if (r.code === 202) {
           if (r.data.message) toast(r.data.message);
+          switchView("track"); /* 编译已启动：带用户到进度视图看轨道（Descript 工作流范式） */
           poll();
         } else if (r.code === 409 && Array.isArray(r.data.awaiting_region)) {
           /* 录屏区域门禁（规格 §3.6）：服务端 message 已点名待确认事件 */
@@ -462,8 +665,52 @@
       });
   }
 
+  /* 应用内确认模态：替代 window.confirm——原生弹窗与应用风格割裂，且会被
+     无头浏览器/自动化默认拒绝（实测：点击停止后静默未停，管线继续跑）。
+     键盘可达：取消钮初始焦点、Esc 关闭、点遮罩关闭。 */
+  function appConfirm(message, confirmLabel, onYes, onNo) {
+    var back = document.createElement("div");
+    back.className = "modal-backdrop";
+    back.setAttribute("role", "dialog");
+    back.setAttribute("aria-modal", "true");
+    back.setAttribute("aria-label", "请确认");
+    var box = document.createElement("div");
+    box.className = "modal";
+    var head = document.createElement("div");
+    head.className = "modal-head";
+    var strong = document.createElement("strong");
+    strong.textContent = "请确认";
+    head.appendChild(strong);
+    var msg = document.createElement("p");
+    msg.className = "dim";
+    msg.style.margin = "10px 0 16px";
+    msg.textContent = message;
+    var row = document.createElement("div");
+    row.style.textAlign = "right";
+    var no = document.createElement("button");
+    no.className = "btn btn-ghost"; no.type = "button"; no.textContent = "取消";
+    var yes = document.createElement("button");
+    yes.className = "btn btn-stop"; yes.type = "button"; yes.textContent = confirmLabel || "确认";
+    row.appendChild(no); row.appendChild(yes);
+    box.appendChild(head); box.appendChild(msg); box.appendChild(row);
+    back.appendChild(box); document.body.appendChild(back);
+    back.classList.add("confirm-open");
+    no.focus();
+    var answered = false;
+    function close() { if (back.isConnected) back.remove(); }
+    function deny() { if (answered) return; answered = true; if (onNo) onNo(); }
+    no.addEventListener("click", function () { close(); deny(); });
+    yes.addEventListener("click", function () { answered = true; close(); onYes(); });
+    back.addEventListener("keydown", function (e) {
+      if (e.key === "Escape") { e.preventDefault(); close(); deny(); }
+    });
+    back.addEventListener("click", function (e) { if (e.target === back) { close(); deny(); } });
+    return back;
+  }
+
   function stopCompile() {
-    if (!window.confirm("确定停止当前编译？未完成的阶段将被中断。")) return;
+    if (document.querySelector(".confirm-open")) return;  /* 防重入：连点不叠模态 */
+    var back = appConfirm("确定停止当前编译？未完成的阶段将被中断。", "确认停止", function () {
     fetch("/api/stop", { method: "POST" })
       .then(function (res) {
         return res.json().catch(function () { return {}; }).then(function (data) {
@@ -478,6 +725,7 @@
       .catch(function (err) {
         toast("网络错误：" + (err && err.message ? err.message : err), "error");
       });
+    });
   }
 
   /* ---- 输出目录：原生文件夹选择 ---------------------------------------- */

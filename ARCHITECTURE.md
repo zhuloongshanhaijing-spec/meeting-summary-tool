@@ -59,11 +59,3 @@ none — it just opens `outputs/<event>/meeting.db`.
 
 A wrong claim can always be walked back to the exact sentence and second
 it came from. That walk-back is the product.
-
-
-## Web console observability
-
-The engine emits side-channel progress (12-stage snapshot + timeline)
-for the local web console; the CLI output itself is unchanged. Spec:
-`docs/PROGRESS_CONTRACT.md`. Visibility semantics of `_private` events
-across MCP/CLI/web: `PRIVACY_AND_DATA_FLOW.md`.
